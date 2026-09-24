@@ -11,3 +11,5 @@ supabase/.temp
 supabase/.branches
 
 .idea
+
+.vercel
