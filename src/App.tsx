@@ -4,6 +4,7 @@ import {Menu, Gamepad2, Plus, Copy, User, LockKeyhole} from "lucide-react";
 import CatalogScreen from "./CatalogScreen";
 import EmptyAccountsScreen from "./EmptyAccountsScreen";
 import AddOrderModal from "./AddOrderModal";
+import OrdersHistoryScreen from "./OrdersHistoryScreen";
 import {API_URL} from "./config";
 
 function AuthWall({onLoginSuccess}: { onLoginSuccess: (user: any) => void }) {
@@ -202,6 +203,23 @@ export default function App() {
         return <AuthWall onLoginSuccess={(user) => setAuthUser(user)}/>;
     }
 
+    const profileInfo = (
+        <div className="flex flex-col items-center gap-4">
+            <div>
+                Вы вошли как: <span className="text-white">{authUser.name} ({authUser.role})</span>
+            </div>
+            <button
+                onClick={() => {
+                    localStorage.removeItem("app_auth_session");
+                    setAuthUser(null);
+                }}
+                className="px-6 py-2 bg-red-500/10 text-red-500 rounded-full border border-red-500/20 active:scale-95 transition-all"
+            >
+                Выйти из аккаунта
+            </button>
+        </div>
+    );
+
     return (
         <div
             className="max-w-md mx-auto relative min-h-[100dvh] bg-[#121212] text-white font-sans overflow-x-hidden shadow-2xl pb-32">
@@ -234,21 +252,23 @@ export default function App() {
             )}
 
             {currentScreen === "profile" && currentScreen !== "add_order" && (
-                <div
-                    className="p-10 text-center text-neutral-500 pt-60 font-bold uppercase tracking-widest text-xs flex flex-col items-center gap-4">
-                    <div>
-                        Вы вошли как: <span className="text-white">{authUser.name} ({authUser.role})</span>
+                authUser.role === "admin" ? (
+                    <OrdersHistoryScreen
+                        variables={variables}
+                        API_URL={API_URL}
+                        footer={
+                            <div
+                                className="mt-10 pt-6 border-t border-white/5 text-center text-neutral-500 font-bold uppercase tracking-widest text-xs">
+                                {profileInfo}
+                            </div>
+                        }
+                    />
+                ) : (
+                    <div
+                        className="p-10 text-center text-neutral-500 pt-60 font-bold uppercase tracking-widest text-xs">
+                        {profileInfo}
                     </div>
-                    <button
-                        onClick={() => {
-                            localStorage.removeItem("app_auth_session");
-                            setAuthUser(null);
-                        }}
-                        className="px-6 py-2 bg-red-500/10 text-red-500 rounded-full border border-red-500/20 active:scale-95 transition-all"
-                    >
-                        Выйти из аккаунта
-                    </button>
-                </div>
+                )
             )}
 
             <AnimatePresence>

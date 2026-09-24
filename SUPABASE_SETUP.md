@@ -435,6 +435,7 @@ npx vercel --prod
 | `addAccount` | `gameName, edition, login, expense, currency, employee, manualDate?` | Создаёт аккаунт (слоты пустые), убирает из `empty_accounts`, TG |
 | `addOrder` | `login, gameName, edition, client, slot, price, paymentMethod, employee, expense?, currency?, manualDate?` | Пишет заказ; занимает/освобождает слот; если логина ещё нет — создаёт аккаунт; чистит пустые; TG |
 | `getSlotHistory` | `login` | `{ success, history:[{client, slot, date, price}] }` |
+| `getOrders` | `search?, kind? ('all'\|'orders'\|'returns'\|'manual'), employee?, from? (ISO), to? (ISO), offset?` | Журнал заказов для админки, новые сверху, по 50 шт. `{ success, orders:[{id, login, gameName, edition, client, slot, price, paymentMethod, employee, event, createdAt}], hasMore, totals:{count, revenue, refunds, net} }` |
 | `getAccountInfo` | `login` | `{ success, spent, received, profit, createdAt }` (агрегаты по `accounts`+`orders`) |
 | `updateAccountExpense` | `login, gameName?, edition?, expense` | Ставит `expense_fiat=expense, rate=1, currency='RUB'` у совпавших аккаунтов |
 | `toggleSlot` | `gameName, edition, email, slotIndex (0-based), newValue ('' = освободить, иначе занять)` | Переключает `slot{index+1}` |

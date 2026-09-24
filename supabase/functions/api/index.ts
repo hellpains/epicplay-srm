@@ -539,6 +539,91 @@ async function handleGetSlotHistory(data: any) {
   return json({ success: true, history });
 }
 
+const ORDERS_PAGE_SIZE = 50;
+
+function applyOrderFilters(q: any, data: any) {
+  const search = (data.search ?? "")
+    .toString()
+    .trim()
+    .replace(/[,()%*\\]/g, " ")
+    .trim();
+  if (search) {
+    const p = `%${search}%`;
+    q = q.or(
+      `client.ilike.${p},login.ilike.${p},game_name.ilike.${p}`,
+    );
+  }
+
+  if (data.employee) q = q.eq("employee", data.employee);
+  if (data.from) q = q.gte("created_at", data.from);
+  if (data.to) q = q.lt("created_at", data.to);
+
+  const kind = (data.kind ?? "all").toString();
+  if (kind === "manual") {
+    q = q.in("event", ["manual_free", "manual_occupy"]);
+  } else {
+    q = q.eq("event", "");
+    if (kind === "orders") q = q.not("slot", "ilike", "%возврат%");
+    if (kind === "returns") q = q.ilike("slot", "%возврат%");
+  }
+  return q;
+}
+
+async function handleGetOrders(data: any) {
+  const offset = Math.max(0, Number(data.offset) || 0);
+
+  const [pageRes, totalsRes] = await Promise.all([
+    applyOrderFilters(
+      db
+        .from("orders")
+        .select(
+          "id, login, game_name, edition, client, slot, price, payment_method, employee, event, created_at",
+        ),
+      data,
+    )
+      .order("created_at", { ascending: false })
+      .range(offset, offset + ORDERS_PAGE_SIZE - 1),
+    applyOrderFilters(db.from("orders").select("slot, price, event"), data),
+  ]);
+
+  if (pageRes.error) return json({ success: false, error: pageRes.error.message });
+
+  let revenue = 0;
+  let refunds = 0;
+  let count = 0;
+  for (const r of totalsRes.data ?? []) {
+    count++;
+    if (r.event) continue;
+    const price = Number(r.price ?? 0);
+    if (String(r.slot ?? "").toLowerCase().includes("возврат")) {
+      refunds += Math.abs(price);
+    } else {
+      revenue += price;
+    }
+  }
+
+  const orders = (pageRes.data ?? []).map((r: any) => ({
+    id: r.id,
+    login: r.login ?? "",
+    gameName: r.game_name ?? "",
+    edition: r.edition ?? "",
+    client: r.client ?? "",
+    slot: r.slot ?? "",
+    price: r.price,
+    paymentMethod: r.payment_method ?? "",
+    employee: r.employee ?? "",
+    event: r.event ?? "",
+    createdAt: r.created_at,
+  }));
+
+  return json({
+    success: true,
+    orders,
+    hasMore: orders.length === ORDERS_PAGE_SIZE,
+    totals: { count, revenue, refunds, net: revenue - refunds },
+  });
+}
+
 async function handleUpdateGame(data: any) {
   const id = data.id;
   if (!id) return json({ success: false, error: "Нет id" });
@@ -780,6 +865,8 @@ Deno.serve(async (req) => {
           return await handleAddOrder(data);
         case "getSlotHistory":
           return await handleGetSlotHistory(data);
+        case "getOrders":
+          return await handleGetOrders(data);
         case "getAccountInfo":
           return await handleGetAccountInfo(data);
         case "updateAccountExpense":
