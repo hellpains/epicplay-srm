@@ -389,7 +389,7 @@ export default function CatalogScreen({
 
   const getTotalAccounts = (item: any) => {
     if (!item.accountDetails) return 0;
-    return Object.values(item.accountDetails).reduce(
+    return Object.values(item.accountDetails).reduce<number>(
       (total, accounts) => total + ((accounts as any[])?.length || 0),
       0
     );

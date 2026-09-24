@@ -223,7 +223,7 @@ export default function App() {
     return (
         <div
             className="max-w-md mx-auto relative min-h-[100dvh] bg-[#121212] text-white font-sans overflow-x-hidden shadow-2xl pb-32">
-            {currentScreen === "catalog" && currentScreen !== "add_order" && (
+            {currentScreen === "catalog" && (
                 <CatalogScreen
                     items={items}
                     setItems={setItems}
@@ -236,7 +236,7 @@ export default function App() {
                 />
             )}
 
-            {currentScreen === "empty" && currentScreen !== "add_order" && (
+            {currentScreen === "empty" && (
                 <EmptyAccountsScreen
                     emptyAccounts={emptyAccounts}
                     setEmptyAccounts={setEmptyAccounts}
@@ -247,11 +247,11 @@ export default function App() {
                 />
             )}
 
-            {currentScreen === "templates" && currentScreen !== "add_order" && (
+            {currentScreen === "templates" && (
                 <TemplatesScreen/>
             )}
 
-            {currentScreen === "profile" && currentScreen !== "add_order" && (
+            {currentScreen === "profile" && (
                 authUser.role === "admin" ? (
                     <ActivityScreen
                         API_URL={API_URL}
