@@ -145,4 +145,5 @@ Personal access token (`sbp_...`) — доступ ко **всему** акка�
   `variables = {employees, paymentMethods, currencies, regions:[{emoji,code}]}`.
 - **Секреты:** только в Supabase secrets / `.env`, никогда в коде.
 #   e p i c p l a y - s r m  
+ #   e p i c p l a y - s r m  
  
