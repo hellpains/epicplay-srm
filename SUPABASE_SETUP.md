@@ -435,7 +435,11 @@ npx vercel --prod
 | `addAccount` | `gameName, edition, login, expense, currency, employee, manualDate?` | Создаёт аккаунт (слоты пустые), убирает из `empty_accounts`, TG |
 | `addOrder` | `login, gameName, edition, client, slot, price, paymentMethod, employee, expense?, currency?, manualDate?` | Пишет заказ; занимает/освобождает слот; если логина ещё нет — создаёт аккаунт; чистит пустые; TG |
 | `getSlotHistory` | `login` | `{ success, history:[{client, slot, date, price}] }` |
-| `getActivity` | `search?, type? (all/order/game/account/slot/empty), offset?` | Журнал действий (таблица `activity_log`), новые сверху, по 50 шт. `{ success, events:[{id, type, title, details, login, gameName, actor, price, createdAt}], hasMore }`. Все изменяющие действия принимают необязательное поле `actor` — кто совершил действие |
+| `getActivity` | `search?, type? (all/order/game/account/empty), offset?` | Журнал действий (таблица `activity_log`, без ручных действий со слотами), новые сверху, по 50 шт. `{ success, events:[{id, type, action, title, details, login, gameName, actor, price, createdAt}], hasMore }`. Все изменяющие действия принимают необязательное поле `actor` — кто совершил действие |
+| `getActivityItem` | `id` | Текущие значения редактируемых полей записи журнала: `{ success, fields, linked }`. `linked=false` — исходных данных уже нет, запись можно только убрать |
+| `updateActivity` | `id, fields` | Правит исходные данные записи (заказ, аккаунт, игру, издание, пустой аккаунт) и саму запись журнала |
+| `deleteActivity` | `id` | Отменяет действие (удаляет заказ и возвращает слот, удаляет игру/аккаунт, откатывает изменения) и заменяет запись на «Удалён …» (`action='deleted'`, в `undo.journal` — всё, что изменено). `{ success, warnings[] }` или `{ success:false, error }`. Для записи `deleted` — удаляет её насовсем |
+| `restoreActivity` | `id` записи `deleted` | Возвращает всё, что убрало удаление, вместе с исходной записью журнала |
 | `getAccountInfo` | `login` | `{ success, spent, received, profit, createdAt }` (агрегаты по `accounts`+`orders`) |
 | `updateAccountExpense` | `login, gameName?, edition?, expense` | Ставит `expense_fiat=expense, rate=1, currency='RUB'` у совпавших аккаунтов |
 | `toggleSlot` | `gameName, edition, email, slotIndex (0-based), newValue ('' = освободить, иначе занять)` | Переключает `slot{index+1}` |

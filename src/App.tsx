@@ -255,6 +255,8 @@ export default function App() {
                 authUser.role === "admin" ? (
                     <ActivityScreen
                         API_URL={API_URL}
+                        variables={variables}
+                        fetchItems={fetchItems}
                         footer={
                             <div
                                 className="mt-10 pt-6 border-t border-white/5 text-center text-neutral-500 font-bold uppercase tracking-widest text-xs">

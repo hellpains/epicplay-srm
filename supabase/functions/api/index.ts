@@ -246,6 +246,8 @@ async function applySlot(row: any, slotName: string) {
   patch[targetField] = valToSet;
   const { error } = await db.from("accounts").update(patch).eq("id", row.id);
   if (error) throw new Error(error.message);
+
+  return { accountId: row.id, field: targetField, value: valToSet };
 }
 
 async function findAccountByLogin(loginValue: string) {
@@ -269,13 +271,17 @@ async function isSubscriptionName(name: string) {
   return !!data;
 }
 
+// Возвращает удалённые строки, чтобы их можно было восстановить при отмене
 async function clearEmptyAccount(loginValue: string) {
-  await db
+  const { data } = await db
     .from("empty_accounts")
     .delete()
-    .ilike("email", loginValue.trim().toLowerCase());
+    .ilike("email", loginValue.trim().toLowerCase())
+    .select("email, region, status, is_problem");
+  return data ?? [];
 }
 
+// track заполняется даже при ошибке слота: что создали и какой слот поменяли
 async function allocateSlot(
   loginValue: string,
   gameName: string,
@@ -284,11 +290,12 @@ async function allocateSlot(
   expense: string,
   currency: string,
   purchaseDate: string,
+  track: { slot?: any; createdAccountId?: string } = {},
 ) {
   const found = await findAccountByLogin(loginValue);
 
   if (found) {
-    await applySlot(found, slotStr);
+    track.slot = await applySlot(found, slotStr);
     return;
   }
 
@@ -327,7 +334,8 @@ async function allocateSlot(
     .single();
 
   if (error) throw new Error(error.message);
-  await applySlot(inserted, slotStr);
+  track.createdAccountId = inserted.id;
+  track.slot = await applySlot(inserted, slotStr);
 }
 
 async function handleAddGame(data: any) {
@@ -345,22 +353,32 @@ async function handleAddGame(data: any) {
     coverUrl = await getPSImageUrl(name);
   }
 
-  const { error } = await db.from("catalog_items").insert({
-    type,
-    name,
-    has_ps5: data.hasPS5 !== undefined ? data.hasPS5 : true,
-    has_ps4: data.hasPS4 !== undefined ? data.hasPS4 : true,
-    cover_url: coverUrl,
-    editions,
-  });
+  const { data: inserted, error } = await db
+    .from("catalog_items")
+    .insert({
+      type,
+      name,
+      has_ps5: data.hasPS5 !== undefined ? data.hasPS5 : true,
+      has_ps4: data.hasPS4 !== undefined ? data.hasPS4 : true,
+      cover_url: coverUrl,
+      editions,
+    })
+    .select("id")
+    .single();
 
   if (error) return json({ error: error.message });
 
-  await logActivity("game", isSub ? "Добавлена подписка" : "Добавлена игра", {
-    details: editions.length ? `${name} · ${editions.join(", ")}` : name,
-    gameName: name,
-    actor: data.actor,
-  });
+  await logActivity(
+    "game",
+    "game_add",
+    isSub ? "Добавлена подписка" : "Добавлена игра",
+    {
+      details: editions.length ? `${name} · ${editions.join(", ")}` : name,
+      gameName: name,
+      actor: data.actor,
+      refId: inserted.id,
+    },
+  );
 
   await sendTG(
     "🎮 <b>ДОБАВЛЕНА НОВАЯ " + (isSub ? "ПОДПИСКА" : "ИГРА") +
@@ -390,7 +408,7 @@ async function handleBackfillCovers() {
   }
 
   if (updated > 0) {
-    await logActivity("game", "Подтянуты обложки", {
+    await logActivity("game", "covers", "Подтянуты обложки", {
       details: `Обновлено: ${updated}`,
     });
   }
@@ -428,10 +446,12 @@ async function handleAddEdition(data: any) {
 
   if (error) return json({ error: error.message });
 
-  await logActivity("game", "Добавлено издание", {
+  await logActivity("game", "edition_add", "Добавлено издание", {
     details: gameLabel(name, newEdition),
     gameName: name,
     actor: data.actor,
+    refId: row.id,
+    undo: { edition: newEdition },
   });
   return json({ success: true });
 }
@@ -443,28 +463,34 @@ async function handleAddAccount(data: any) {
   const rate = await getRate(data.currency);
   const fiat = parseFloat(String(data.expense).replace(",", ".")) || 0;
 
-  const { error } = await db.from("accounts").insert({
-    kind,
-    game_name: data.gameName,
-    edition: data.edition ?? "",
-    login: data.login,
-    purchase_date: finalDate,
-    expense_fiat: fiat,
-    currency: data.currency ?? "",
-    rate,
-  });
+  const { data: inserted, error } = await db
+    .from("accounts")
+    .insert({
+      kind,
+      game_name: data.gameName,
+      edition: data.edition ?? "",
+      login: data.login,
+      purchase_date: finalDate,
+      expense_fiat: fiat,
+      currency: data.currency ?? "",
+      rate,
+    })
+    .select("id")
+    .single();
 
   if (error) return json({ error: error.message });
 
-  await clearEmptyAccount(data.login);
+  const clearedEmpty = await clearEmptyAccount(data.login);
 
   const total = fiat * rate;
-  await logActivity("account", "Добавлен аккаунт", {
-    details: gameLabel(data.gameName, data.edition) +
-      (total ? ` · расход ${Math.round(total)} ₽` : ""),
+  await logActivity("account", "account_add", "Добавлен аккаунт", {
+    details: accountDetails(data.gameName, data.edition, total),
     login: data.login,
     gameName: data.gameName,
     actor: data.actor || data.employee,
+    refId: inserted.id,
+    undo: { clearedEmpty },
+    createdAt: finalDate,
   });
 
   let msg = "🆕 <b>Новый аккаунт</b>\n\n";
@@ -480,19 +506,21 @@ async function handleAddAccount(data: any) {
 async function handleAddOrder(data: any) {
   const finalDate = resolveDate(data.manualDate);
 
-  const { error: orderError } = await db.from("orders").insert({
-    login: data.login,
-    game_name: data.gameName,
-    edition: data.edition,
-    client: data.client,
-    slot: data.slot,
-    price: data.price === "" || data.price === undefined
-      ? null
-      : Number(String(data.price).replace(",", ".")),
-    payment_method: data.paymentMethod ?? "",
-    employee: data.employee ?? "",
-    created_at: finalDate,
-  });
+  const { data: order, error: orderError } = await db
+    .from("orders")
+    .insert({
+      login: data.login,
+      game_name: data.gameName,
+      edition: data.edition,
+      client: data.client,
+      slot: data.slot,
+      price: parsePrice(data.price),
+      payment_method: data.paymentMethod ?? "",
+      employee: data.employee ?? "",
+      created_at: finalDate,
+    })
+    .select("id")
+    .single();
 
   if (orderError) {
     await sendTG(
@@ -505,6 +533,8 @@ async function handleAddOrder(data: any) {
   let hasErrors = false;
   let slotErrorMsg = "";
   let cleanError = false;
+  const track: { slot?: any; createdAccountId?: string } = {};
+  let clearedEmpty: any[] = [];
 
   try {
     await allocateSlot(
@@ -515,6 +545,7 @@ async function handleAddOrder(data: any) {
       data.expense,
       data.currency,
       finalDate,
+      track,
     );
   } catch (err) {
     hasErrors = true;
@@ -522,23 +553,32 @@ async function handleAddOrder(data: any) {
   }
 
   try {
-    await clearEmptyAccount(data.login);
+    clearedEmpty = await clearEmptyAccount(data.login);
   } catch (_err) {
     hasErrors = true;
     cleanError = true;
   }
 
   const isReturn = String(data.slot).toLowerCase().indexOf("возврат") !== -1;
-  const orderPrice = Number(String(data.price ?? "").replace(",", "."));
-  await logActivity("order", isReturn ? "Возврат" : "Новый заказ", {
-    details: [gameLabel(data.gameName, data.edition), data.slot, data.client]
-      .filter(Boolean)
-      .join(" · "),
-    login: data.login,
-    gameName: data.gameName,
-    actor: data.actor || data.employee,
-    price: data.price === "" || isNaN(orderPrice) ? null : orderPrice,
-  });
+  await logActivity(
+    "order",
+    isReturn ? "order_return" : "order_add",
+    isReturn ? "Возврат" : "Новый заказ",
+    {
+      details: orderDetails(data.gameName, data.edition, data.slot, data.client),
+      login: data.login,
+      gameName: data.gameName,
+      actor: data.actor || data.employee,
+      price: parsePrice(data.price),
+      refId: order.id,
+      undo: {
+        slot: track.slot ?? null,
+        createdAccountId: track.createdAccountId ?? null,
+        clearedEmpty,
+      },
+      createdAt: finalDate,
+    },
+  );
 
   let msg = "🛒 <b>" + (isReturn ? "ОФОРМЛЕН ВОЗВРАТ" : "НОВЫЙ ЗАКАЗ") + "</b>\n\n";
   msg += "👤 <b>Клиент:</b> " + data.client + "\n";
@@ -579,8 +619,11 @@ async function handleGetSlotHistory(data: any) {
 const ACTIVITY_PAGE_SIZE = 50;
 
 // Пишет событие в журнал. Ошибка журнала не должна ломать само действие.
+// action — код действия (order_add, game_add, ...), по нему журнал умеет
+// править и отменять запись; refId — строка-источник, undo — состояние «до».
 async function logActivity(
   type: string,
+  action: string,
   title: string,
   fields: {
     details?: string;
@@ -588,17 +631,24 @@ async function logActivity(
     gameName?: string;
     actor?: string;
     price?: number | null;
+    refId?: string | null;
+    undo?: unknown;
+    createdAt?: string;
   } = {},
 ) {
   try {
     await db.from("activity_log").insert({
       type,
+      action,
       title,
       details: fields.details ?? "",
       login: (fields.login ?? "").toString().trim(),
       game_name: fields.gameName ?? "",
       actor: (fields.actor ?? "").toString().trim(),
       price: fields.price ?? null,
+      ref_id: fields.refId ?? null,
+      undo: fields.undo ?? null,
+      ...(fields.createdAt ? { created_at: fields.createdAt } : {}),
     });
   } catch (_e) {
     return;
@@ -609,12 +659,35 @@ function gameLabel(gameName: string, edition?: string) {
   return edition ? `${gameName} (${edition})` : gameName;
 }
 
+function orderDetails(gameName: string, edition: string, slot: string, client: string) {
+  return [gameLabel(gameName, edition), slot, client].filter(Boolean).join(" · ");
+}
+
+function accountDetails(gameName: string, edition: string, expense: number) {
+  return gameLabel(gameName, edition) +
+    (expense ? ` · расход ${Math.round(expense)} ₽` : "");
+}
+
+function expenseDetails(gameName: string, edition: string, value: number) {
+  return [gameName && gameLabel(gameName, edition), `${value} ₽`]
+    .filter(Boolean)
+    .join(" · ");
+}
+
+function parsePrice(value: unknown): number | null {
+  if (value === "" || value === undefined || value === null) return null;
+  const n = Number(String(value).replace(",", "."));
+  return isNaN(n) ? null : n;
+}
+
 async function handleGetActivity(data: any) {
   const offset = Math.max(0, Number(data.offset) || 0);
 
   let q = db
     .from("activity_log")
-    .select("id, type, title, details, login, game_name, actor, price, created_at");
+    .select(
+      "id, type, action, title, details, login, game_name, actor, price, created_at, sort_at, edited_at, restored_at",
+    );
 
   const search = (data.search ?? "")
     .toString()
@@ -627,10 +700,12 @@ async function handleGetActivity(data: any) {
       `title.ilike.${p},details.ilike.${p},login.ilike.${p},game_name.ilike.${p},actor.ilike.${p}`,
     );
   }
+  // Ручные действия со слотами в журнале не показываем (есть в истории слота)
+  q = q.neq("type", "slot");
   if (data.type && data.type !== "all") q = q.eq("type", data.type);
 
   const { data: rows, error } = await q
-    .order("created_at", { ascending: false })
+    .order("sort_at", { ascending: false })
     .range(offset, offset + ACTIVITY_PAGE_SIZE - 1);
 
   if (error) return json({ success: false, error: error.message });
@@ -638,6 +713,7 @@ async function handleGetActivity(data: any) {
   const events = (rows ?? []).map((r: any) => ({
     id: r.id,
     type: r.type,
+    action: r.action ?? "",
     title: r.title,
     details: r.details ?? "",
     login: r.login ?? "",
@@ -645,6 +721,9 @@ async function handleGetActivity(data: any) {
     actor: r.actor ?? "",
     price: r.price,
     createdAt: r.created_at,
+    sortAt: r.sort_at,
+    editedAt: r.edited_at,
+    restoredAt: r.restored_at,
   }));
 
   return json({
@@ -652,6 +731,597 @@ async function handleGetActivity(data: any) {
     events,
     hasMore: events.length === ACTIVITY_PAGE_SIZE,
   });
+}
+
+async function loadActivity(id: unknown) {
+  if (!id) return null;
+  const { data } = await db
+    .from("activity_log")
+    .select("*")
+    .eq("id", id)
+    .maybeSingle();
+  return data;
+}
+
+async function fetchRef(table: string, id: unknown) {
+  if (!id) return null;
+  const { data } = await db.from(table).select("*").eq("id", id).maybeSingle();
+  return data;
+}
+
+function str(value: unknown) {
+  return (value ?? "").toString().trim();
+}
+
+// Текущие значения полей записи журнала. null — исходных данных больше нет
+// (или действие не откатывается): можно только убрать строку из журнала.
+async function activityFields(ev: any): Promise<Record<string, unknown> | null> {
+  switch (ev.action) {
+    case "order_add":
+    case "order_return": {
+      const o = await fetchRef("orders", ev.ref_id);
+      if (!o) return null;
+      return {
+        client: o.client ?? "",
+        price: o.price,
+        paymentMethod: o.payment_method ?? "",
+        employee: o.employee ?? "",
+      };
+    }
+    case "account_add": {
+      const a = await fetchRef("accounts", ev.ref_id);
+      if (!a) return null;
+      return { login: a.login ?? "", expense: Number(a.expense_total ?? 0) };
+    }
+    case "account_expense": {
+      const a = await fetchRef("accounts", ev.undo?.prev?.[0]?.id);
+      if (!a) return null;
+      return { expense: Number(a.expense_total ?? 0) };
+    }
+    case "game_add": {
+      const g = await fetchRef("catalog_items", ev.ref_id);
+      return g ? { name: g.name } : null;
+    }
+    case "edition_add": {
+      const g = await fetchRef("catalog_items", ev.ref_id);
+      const edition = ev.undo?.edition;
+      if (!g || !edition || !(g.editions ?? []).includes(edition)) return null;
+      return { edition };
+    }
+    case "game_update":
+      return ev.undo?.before && (await fetchRef("catalog_items", ev.ref_id))
+        ? {}
+        : null;
+    case "empty_add":
+    case "empty_update": {
+      const e = await fetchRef("empty_accounts", ev.ref_id);
+      return e ? { email: e.email, region: e.region } : null;
+    }
+    case "empty_trash":
+    case "empty_restore":
+      return (await fetchRef("empty_accounts", ev.ref_id)) ? {} : null;
+    case "deleted":
+      return {};
+    default:
+      return null;
+  }
+}
+
+async function handleGetActivityItem(data: any) {
+  const ev = await loadActivity(data.id);
+  if (!ev) return json({ success: false, error: "Запись не найдена" });
+  const fields = await activityFields(ev);
+  return json({ success: true, fields: fields ?? {}, linked: fields !== null });
+}
+
+async function handleUpdateActivity(data: any) {
+  const ev = await loadActivity(data.id);
+  if (!ev) return json({ success: false, error: "Запись не найдена" });
+  if (!(await activityFields(ev))) {
+    return json({ success: false, error: "Исходные данные уже удалены — изменить нельзя" });
+  }
+  const f = data.fields ?? {};
+
+  switch (ev.action) {
+    case "order_add":
+    case "order_return": {
+      const o = await fetchRef("orders", ev.ref_id);
+      let price = f.price !== undefined ? parsePrice(f.price) : o.price;
+      if (ev.action === "order_return" && price !== null && price > 0) price = -price;
+      const patch = {
+        client: f.client !== undefined ? str(f.client) : o.client,
+        price,
+        payment_method: f.paymentMethod !== undefined ? str(f.paymentMethod) : o.payment_method,
+        employee: f.employee !== undefined ? str(f.employee) : o.employee,
+      };
+      const { error } = await db.from("orders").update(patch).eq("id", o.id);
+      if (error) return json({ success: false, error: error.message });
+      await db
+        .from("activity_log")
+        .update({
+          details: orderDetails(o.game_name, o.edition, o.slot, patch.client),
+          price: patch.price,
+          actor: patch.employee || ev.actor,
+        })
+        .eq("id", ev.id);
+      break;
+    }
+    case "account_add": {
+      const a = await fetchRef("accounts", ev.ref_id);
+      const newLogin = str(f.login) || a.login;
+      const patch: Record<string, unknown> = { login: newLogin };
+      let expense = Number(a.expense_total ?? 0);
+      if (f.expense !== undefined) {
+        const value = parseFloat(String(f.expense).replace(",", ".")) || 0;
+        if (value !== expense) {
+          Object.assign(patch, { expense_fiat: value, rate: 1, currency: "RUB" });
+          expense = value;
+        }
+      }
+      const { error } = await db.from("accounts").update(patch).eq("id", a.id);
+      if (error) return json({ success: false, error: error.message });
+      if (newLogin !== a.login) {
+        await db
+          .from("orders")
+          .update({ login: newLogin })
+          .ilike("login", a.login)
+          .eq("game_name", a.game_name);
+        await db
+          .from("activity_log")
+          .update({ login: newLogin })
+          .ilike("login", a.login)
+          .eq("game_name", a.game_name);
+      }
+      await db
+        .from("activity_log")
+        .update({
+          login: newLogin,
+          details: accountDetails(a.game_name, a.edition, expense),
+        })
+        .eq("id", ev.id);
+      break;
+    }
+    case "account_expense": {
+      const value = parseFloat(String(f.expense ?? "").replace(",", ".")) || 0;
+      const ids = (ev.undo?.prev ?? []).map((p: any) => p.id);
+      const { error } = await db
+        .from("accounts")
+        .update({ expense_fiat: value, rate: 1, currency: "RUB" })
+        .in("id", ids);
+      if (error) return json({ success: false, error: error.message });
+      await db
+        .from("activity_log")
+        .update({ details: String(ev.details).replace(/-?[\d.,]+ ₽$/, `${value} ₽`) })
+        .eq("id", ev.id);
+      break;
+    }
+    case "game_add": {
+      const g = await fetchRef("catalog_items", ev.ref_id);
+      const newName = str(f.name);
+      if (!newName) return json({ success: false, error: "Введите название" });
+      if (newName !== g.name) {
+        const { data: taken } = await db
+          .from("catalog_items")
+          .select("id")
+          .eq("type", g.type)
+          .eq("name", newName)
+          .maybeSingle();
+        if (taken) return json({ success: false, error: "Игра с таким названием уже есть" });
+        const { error } = await db
+          .from("catalog_items")
+          .update({ name: newName })
+          .eq("id", g.id);
+        if (error) return json({ success: false, error: error.message });
+        await renameGame(g.name, newName, g.type);
+      }
+      await db
+        .from("activity_log")
+        .update({ details: newName, game_name: newName })
+        .eq("id", ev.id);
+      break;
+    }
+    case "edition_add": {
+      const g = await fetchRef("catalog_items", ev.ref_id);
+      const oldEdition = ev.undo.edition;
+      const newEdition = str(f.edition);
+      if (!newEdition) return json({ success: false, error: "Введите издание" });
+      if (newEdition !== oldEdition) {
+        if ((g.editions ?? []).includes(newEdition)) {
+          return json({ success: false, error: "Такое издание уже есть" });
+        }
+        const editions = (g.editions ?? []).map((e: string) =>
+          e === oldEdition ? newEdition : e
+        );
+        const { error } = await db
+          .from("catalog_items")
+          .update({ editions })
+          .eq("id", g.id);
+        if (error) return json({ success: false, error: error.message });
+        await db
+          .from("accounts")
+          .update({ edition: newEdition })
+          .eq("game_name", g.name)
+          .eq("kind", g.type)
+          .eq("edition", oldEdition);
+        await db
+          .from("orders")
+          .update({ edition: newEdition })
+          .eq("game_name", g.name)
+          .eq("edition", oldEdition);
+      }
+      await db
+        .from("activity_log")
+        .update({
+          details: gameLabel(g.name, newEdition),
+          undo: { edition: newEdition },
+        })
+        .eq("id", ev.id);
+      break;
+    }
+    case "empty_add":
+    case "empty_update": {
+      const email = str(f.email);
+      const region = str(f.region).toUpperCase();
+      if (!email || !region) return json({ success: false, error: "Заполните почту и регион" });
+      const { error } = await db
+        .from("empty_accounts")
+        .update({ email, region })
+        .eq("id", ev.ref_id);
+      if (error) return json({ success: false, error: error.message });
+      await db
+        .from("activity_log")
+        .update({ login: email, details: region })
+        .eq("id", ev.id);
+      break;
+    }
+    default:
+      return json({ success: false, error: "В этой записи нечего менять" });
+  }
+
+  // Изменённая запись — последнее действие: поднимаем её наверх журнала
+  const now = new Date().toISOString();
+  await db
+    .from("activity_log")
+    .update({ sort_at: now, edited_at: now })
+    .eq("id", ev.id);
+
+  return json({ success: true });
+}
+
+// Журнал отката: что поменяли при удалении записи, чтобы потом восстановить.
+// insert — вернуть удалённую строку целиком, update — вернуть прежние значения
+// полей, delete — убрать строку, созданную при откате, rename — имя игры.
+type JournalStep = {
+  table: string;
+  op: "insert" | "update" | "delete" | "rename";
+  row: any;
+};
+
+const GENERATED_COLUMNS: Record<string, string[]> = { accounts: ["expense_total"] };
+const SLOT_FIELDS = ["slot1", "slot2", "slot3", "slot4", "slot5"];
+
+function storable(table: string, row: any) {
+  const copy = { ...row };
+  for (const col of GENERATED_COLUMNS[table] ?? []) delete copy[col];
+  return copy;
+}
+
+function pick(row: any, keys: string[]) {
+  const out: Record<string, unknown> = { id: row.id };
+  for (const k of keys) out[k] = row[k];
+  return out;
+}
+
+async function deleteRows(journal: JournalStep[], table: string, rows: any[]) {
+  for (const row of rows) {
+    journal.push({ table, op: "insert", row: storable(table, row) });
+    await db.from(table).delete().eq("id", row.id);
+  }
+}
+
+async function updateRow(
+  journal: JournalStep[],
+  table: string,
+  row: any,
+  patch: Record<string, unknown>,
+) {
+  journal.push({ table, op: "update", row: pick(row, Object.keys(patch)) });
+  await db.from(table).update(patch).eq("id", row.id);
+}
+
+// Возвращает слот в состояние до действия, если его с тех пор не трогали
+async function revertSlot(journal: JournalStep[], slot: any, warnings: string[]) {
+  const acc = await fetchRef("accounts", slot?.accountId);
+  if (!acc) return;
+  if (toBool(acc[slot.field]) !== slot.value) {
+    warnings.push("Слот уже изменён позже — оставлен как есть");
+    return;
+  }
+  await updateRow(journal, "accounts", acc, { [slot.field]: !slot.value });
+}
+
+// Для старых записей без сохранённого слота: применяем обратное действие
+async function invertSlotByName(
+  journal: JournalStep[],
+  acc: any,
+  slotName: string,
+  undoOccupy: boolean,
+  warnings: string[],
+) {
+  if (!acc) return;
+  const base = slotName.replace(/возврат\s*/i, "").trim();
+  try {
+    await applySlot(acc, undoOccupy ? "Возврат " + base : base);
+  } catch (_e) {
+    warnings.push("Слот " + base + " уже в нужном состоянии — не изменён");
+    return;
+  }
+  const after = await fetchRef("accounts", acc.id);
+  const changed = SLOT_FIELDS.filter((f) => toBool(acc[f]) !== toBool(after?.[f]));
+  if (changed.length) {
+    journal.push({ table: "accounts", op: "update", row: pick(acc, changed) });
+  }
+}
+
+async function restoreEmpty(journal: JournalStep[], rows: any[] | undefined) {
+  for (const row of rows ?? []) {
+    const { data: existing } = await db
+      .from("empty_accounts")
+      .select("id")
+      .ilike("email", row.email)
+      .maybeSingle();
+    if (existing) continue;
+    const { data: inserted } = await db
+      .from("empty_accounts")
+      .insert(row)
+      .select("id")
+      .single();
+    if (inserted) journal.push({ table: "empty_accounts", op: "delete", row: inserted });
+  }
+}
+
+async function countOrders(login: string, gameName: string) {
+  const { count } = await db
+    .from("orders")
+    .select("id", { count: "exact", head: true })
+    .ilike("login", login)
+    .eq("game_name", gameName)
+    .eq("event", "");
+  return count ?? 0;
+}
+
+// Откатывает действие записи журнала, записывая каждое изменение в journal.
+// Все проверки идут до первого изменения. Возвращает текст ошибки или null.
+async function undoActivity(
+  ev: any,
+  warnings: string[],
+  journal: JournalStep[],
+): Promise<string | null> {
+  switch (ev.action) {
+    case "order_add":
+    case "order_return": {
+      const o = await fetchRef("orders", ev.ref_id);
+      if (ev.undo) {
+        if (ev.undo.slot) await revertSlot(journal, ev.undo.slot, warnings);
+      } else {
+        await invertSlotByName(
+          journal,
+          await findAccountByLogin(o.login),
+          o.slot,
+          ev.action !== "order_return",
+          warnings,
+        );
+      }
+      await deleteRows(journal, "orders", [o]);
+
+      const created = await fetchRef("accounts", ev.undo?.createdAccountId);
+      if (created) {
+        if ((await countOrders(created.login, created.game_name)) === 0) {
+          await deleteRows(journal, "accounts", [created]);
+        } else {
+          warnings.push("Аккаунт, созданный этим заказом, оставлен: на нём есть другие заказы");
+        }
+      }
+      await restoreEmpty(journal, ev.undo?.clearedEmpty);
+      return null;
+    }
+    case "account_add": {
+      const a = await fetchRef("accounts", ev.ref_id);
+      const orders = await countOrders(a.login, a.game_name);
+      if (orders > 0) {
+        return `На аккаунте есть заказы (${orders}). Сначала удалите их в истории.`;
+      }
+      const { data: manual } = await db
+        .from("orders")
+        .select("*")
+        .ilike("login", a.login)
+        .eq("game_name", a.game_name);
+      await deleteRows(journal, "orders", manual ?? []);
+      await deleteRows(journal, "accounts", [a]);
+      await restoreEmpty(journal, ev.undo?.clearedEmpty);
+      return null;
+    }
+    case "account_expense": {
+      for (const p of ev.undo?.prev ?? []) {
+        const acc = await fetchRef("accounts", p.id);
+        if (!acc) continue;
+        await updateRow(journal, "accounts", acc, {
+          expense_fiat: p.expense_fiat,
+          rate: p.rate,
+          currency: p.currency,
+        });
+      }
+      return null;
+    }
+    case "game_add": {
+      const g = await fetchRef("catalog_items", ev.ref_id);
+      const { count } = await db
+        .from("accounts")
+        .select("id", { count: "exact", head: true })
+        .eq("game_name", g.name)
+        .eq("kind", g.type);
+      if (count) return `У игры есть аккаунты (${count}). Сначала удалите их в истории.`;
+      const { data: related } = await db
+        .from("activity_log")
+        .select("*")
+        .eq("type", "game")
+        .eq("game_name", g.name)
+        .neq("action", "deleted")
+        .neq("id", ev.id);
+      await deleteRows(journal, "activity_log", related ?? []);
+      await deleteRows(journal, "catalog_items", [g]);
+      return null;
+    }
+    case "edition_add": {
+      const g = await fetchRef("catalog_items", ev.ref_id);
+      const edition = ev.undo.edition;
+      const { count } = await db
+        .from("accounts")
+        .select("id", { count: "exact", head: true })
+        .eq("game_name", g.name)
+        .eq("kind", g.type)
+        .eq("edition", edition);
+      if (count) return `У издания есть аккаунты (${count}). Сначала удалите их в истории.`;
+      const editions = (g.editions ?? []).filter((e: string) => e !== edition);
+      if (editions.length === 0) return "Нельзя удалить единственное издание игры";
+      await updateRow(journal, "catalog_items", g, { editions });
+      return null;
+    }
+    case "game_update": {
+      const g = await fetchRef("catalog_items", ev.ref_id);
+      const before = ev.undo.before;
+      await updateRow(journal, "catalog_items", g, {
+        name: before.name,
+        editions: before.editions,
+        cover_url: before.cover_url,
+        has_ps5: before.has_ps5,
+        has_ps4: before.has_ps4,
+      });
+      if (g.name !== before.name) {
+        await renameGame(g.name, before.name, g.type);
+        journal.push({
+          table: "catalog_items",
+          op: "rename",
+          row: { type: g.type, from: g.name, to: before.name },
+        });
+      }
+      return null;
+    }
+    case "empty_add": {
+      const e = await fetchRef("empty_accounts", ev.ref_id);
+      await deleteRows(journal, "empty_accounts", [e]);
+      return null;
+    }
+    case "empty_update": {
+      const e = await fetchRef("empty_accounts", ev.ref_id);
+      if (ev.undo?.prev) await updateRow(journal, "empty_accounts", e, ev.undo.prev);
+      return null;
+    }
+    case "empty_trash":
+    case "empty_restore": {
+      const e = await fetchRef("empty_accounts", ev.ref_id);
+      await updateRow(journal, "empty_accounts", e, {
+        is_problem: ev.action === "empty_restore",
+      });
+      return null;
+    }
+    default:
+      return null;
+  }
+}
+
+const DELETED_TITLES: Record<string, string> = {
+  order_add: "Удалён заказ",
+  order_return: "Удалён возврат",
+  account_add: "Удалён аккаунт",
+  account_expense: "Отменено изменение расхода",
+  edition_add: "Удалено издание",
+  game_update: "Отменено изменение игры",
+  empty_add: "Удалён пустой аккаунт",
+  empty_update: "Отменено обновление пустого аккаунта",
+  empty_trash: "Отменён перенос в корзину",
+  empty_restore: "Отменено восстановление из корзины",
+};
+
+function deletedTitle(ev: any, linked: boolean) {
+  if (!linked) return `Удалена запись: ${ev.title}`;
+  if (ev.action === "game_add") {
+    return ev.title === "Добавлена подписка" ? "Удалена подписка" : "Удалена игра";
+  }
+  return DELETED_TITLES[ev.action] ?? `Удалена запись: ${ev.title}`;
+}
+
+async function handleDeleteActivity(data: any) {
+  const ev = await loadActivity(data.id);
+  if (!ev) return json({ success: false, error: "Запись не найдена" });
+
+  // Запись об удалении убираем насовсем — восстановить её уже будет нельзя
+  if (ev.action === "deleted") {
+    await db.from("activity_log").delete().eq("id", ev.id);
+    return json({ success: true, warnings: [] });
+  }
+
+  const warnings: string[] = [];
+  const journal: JournalStep[] = [];
+  // Если исходных данных уже нет — откатывать нечего, убираем только запись
+  const linked = (await activityFields(ev)) !== null;
+  if (linked) {
+    const error = await undoActivity(ev, warnings, journal);
+    if (error) return json({ success: false, error });
+  }
+
+  await deleteRows(journal, "activity_log", [ev]);
+  await logActivity(ev.type, "deleted", deletedTitle(ev, linked), {
+    details: ev.details,
+    login: ev.login,
+    gameName: ev.game_name,
+    actor: data.actor,
+    undo: { journal },
+  });
+
+  return json({ success: true, warnings });
+}
+
+// Возвращает всё, что убрало удаление, и саму исходную запись журнала
+async function handleRestoreActivity(data: any) {
+  const ev = await loadActivity(data.id);
+  if (!ev || ev.action !== "deleted") {
+    return json({ success: false, error: "Эту запись нельзя восстановить" });
+  }
+
+  const steps: JournalStep[] = ev.undo?.journal ?? [];
+  for (const step of [...steps].reverse()) {
+    let error: any = null;
+    if (step.op === "rename") {
+      await renameGame(step.row.to, step.row.from, step.row.type);
+    } else if (step.op === "delete") {
+      ({ error } = await db.from(step.table).delete().eq("id", step.row.id));
+    } else if (step.op === "update") {
+      const { id, ...fields } = step.row;
+      ({ error } = await db.from(step.table).update(fields).eq("id", id));
+    } else {
+      ({ error } = await db.from(step.table).upsert(step.row));
+    }
+    if (error) {
+      return json({ success: false, error: "Не удалось восстановить: " + error.message });
+    }
+  }
+
+  // Восстановленная запись — последнее действие: поднимаем её наверх журнала.
+  // Исходная запись журнала всегда удаляется последней, значит, она последняя в steps.
+  const original = [...steps]
+    .reverse()
+    .find((s) => s.table === "activity_log" && s.op === "insert");
+  if (original) {
+    const now = new Date().toISOString();
+    await db
+      .from("activity_log")
+      .update({ sort_at: now, restored_at: now })
+      .eq("id", original.row.id);
+  }
+
+  await db.from("activity_log").delete().eq("id", ev.id);
+  return json({ success: true });
 }
 
 async function handleUpdateGame(data: any) {
@@ -697,17 +1367,7 @@ async function handleUpdateGame(data: any) {
 
   if (error) return json({ success: false, error: error.message });
 
-  if (newName !== oldName) {
-    await db
-      .from("accounts")
-      .update({ game_name: newName })
-      .eq("game_name", oldName)
-      .eq("kind", type);
-    await db
-      .from("orders")
-      .update({ game_name: newName })
-      .eq("game_name", oldName);
-  }
+  await renameGame(oldName, newName, type);
 
   const changes: string[] = [];
   if (newName !== oldName) changes.push(`название: ${oldName} → ${newName}`);
@@ -721,14 +1381,42 @@ async function handleUpdateGame(data: any) {
     );
   }
   if (changes.length > 0) {
-    await logActivity("game", "Изменена игра", {
+    await logActivity("game", "game_update", "Изменена игра", {
       details: `${newName} · ${changes.join("; ")}`,
       gameName: newName,
       actor: data.actor,
+      refId: id,
+      undo: {
+        before: {
+          name: oldName,
+          editions: existing.editions ?? [],
+          cover_url: existing.cover_url,
+          has_ps5: existing.has_ps5,
+          has_ps4: existing.has_ps4,
+        },
+      },
     });
   }
 
   return json({ success: true });
+}
+
+// Переименование игры тянет за собой аккаунты, заказы и журнал
+async function renameGame(oldName: string, newName: string, type: string) {
+  if (oldName === newName) return;
+  await db
+    .from("accounts")
+    .update({ game_name: newName })
+    .eq("game_name", oldName)
+    .eq("kind", type);
+  await db
+    .from("orders")
+    .update({ game_name: newName })
+    .eq("game_name", oldName);
+  await db
+    .from("activity_log")
+    .update({ game_name: newName })
+    .eq("game_name", oldName);
 }
 
 async function handleGetAccountInfo(data: any) {
@@ -778,7 +1466,7 @@ async function handleUpdateAccountExpense(data: any) {
 
   let q = db
     .from("accounts")
-    .update({ expense_fiat: value, rate: 1, currency: "RUB" })
+    .select("id, expense_fiat, rate, currency")
     .ilike("login", login.toLowerCase());
 
   if (data.gameName) q = q.eq("game_name", data.gameName);
@@ -786,16 +1474,23 @@ async function handleUpdateAccountExpense(data: any) {
     q = q.eq("edition", data.edition);
   }
 
-  const { error } = await q;
+  const { data: prev, error: selectError } = await q;
+  if (selectError) return json({ success: false, error: selectError.message });
+
+  const ids = (prev ?? []).map((r: any) => r.id);
+  const { error } = await db
+    .from("accounts")
+    .update({ expense_fiat: value, rate: 1, currency: "RUB" })
+    .in("id", ids);
   if (error) return json({ success: false, error: error.message });
 
-  await logActivity("account", "Изменён расход аккаунта", {
-    details: [data.gameName && gameLabel(data.gameName, data.edition), `${value} ₽`]
-      .filter(Boolean)
-      .join(" · "),
+  await logActivity("account", "account_expense", "Изменён расход аккаунта", {
+    details: expenseDetails(data.gameName, data.edition, value),
     login,
     gameName: data.gameName ?? "",
     actor: data.actor,
+    refId: ids[0] ?? null,
+    undo: { prev: prev ?? [] },
   });
 
   return json({ success: true });
@@ -817,7 +1512,7 @@ async function handleToggleSlot(data: any) {
   patch[field] = occupied;
   await db.from("accounts").update(patch).eq("id", rows[0].id);
 
-  // Фиксируем ручное действие в истории слота
+  // Фиксируем ручное действие в истории слота (в общий журнал не пишем)
   const baseSlot = (data.slotName ?? "").toString().trim();
   await db.from("orders").insert({
     login: (data.email ?? "").toString().trim(),
@@ -828,19 +1523,6 @@ async function handleToggleSlot(data: any) {
     event: occupied ? "manual_occupy" : "manual_free",
     created_at: new Date().toISOString(),
   });
-
-  await logActivity(
-    "slot",
-    occupied ? "Слот занят вручную" : "Слот освобождён вручную",
-    {
-      details: [gameLabel(data.gameName ?? "", data.edition), baseSlot]
-        .filter(Boolean)
-        .join(" · "),
-      login: data.email,
-      gameName: data.gameName ?? "",
-      actor: data.actor,
-    },
-  );
 
   return json({ success: true });
 }
@@ -854,7 +1536,7 @@ async function handleAddEmptyAccount(data: any) {
 
   const { data: existing } = await db
     .from("empty_accounts")
-    .select("id")
+    .select("id, region, status, is_problem")
     .ilike("email", email)
     .maybeSingle();
 
@@ -864,23 +1546,34 @@ async function handleAddEmptyAccount(data: any) {
       .update({ region, status: "Свободен", is_problem: false })
       .eq("id", existing.id);
     if (error) return json({ success: false, error: error.message });
-    await logActivity("empty", "Пустой аккаунт обновлён", {
+    await logActivity("empty", "empty_update", "Пустой аккаунт обновлён", {
       details: region,
       login: email,
       actor: data.actor,
+      refId: existing.id,
+      undo: {
+        prev: {
+          region: existing.region,
+          status: existing.status,
+          is_problem: existing.is_problem,
+        },
+      },
     });
     return json({ success: true });
   }
 
-  const { error } = await db
+  const { data: inserted, error } = await db
     .from("empty_accounts")
-    .insert({ email, region, status: "Свободен", is_problem: false });
+    .insert({ email, region, status: "Свободен", is_problem: false })
+    .select("id")
+    .single();
 
   if (error) return json({ success: false, error: error.message });
-  await logActivity("empty", "Добавлен пустой аккаунт", {
+  await logActivity("empty", "empty_add", "Добавлен пустой аккаунт", {
     details: region,
     login: email,
     actor: data.actor,
+    refId: inserted.id,
   });
   return json({ success: true });
 }
@@ -901,8 +1594,9 @@ async function handleMarkProblem(data: any, value: boolean) {
 
   await logActivity(
     "empty",
+    value ? "empty_trash" : "empty_restore",
     value ? "Пустой аккаунт перенесён в корзину" : "Пустой аккаунт восстановлен из корзины",
-    { login: data.email, actor: data.actor },
+    { login: data.email, actor: data.actor, refId: rows[0].id },
   );
   return json({ success: true });
 }
@@ -954,6 +1648,14 @@ Deno.serve(async (req) => {
           return await handleGetSlotHistory(data);
         case "getActivity":
           return await handleGetActivity(data);
+        case "getActivityItem":
+          return await handleGetActivityItem(data);
+        case "updateActivity":
+          return await handleUpdateActivity(data);
+        case "deleteActivity":
+          return await handleDeleteActivity(data);
+        case "restoreActivity":
+          return await handleRestoreActivity(data);
         case "getAccountInfo":
           return await handleGetAccountInfo(data);
         case "updateAccountExpense":
