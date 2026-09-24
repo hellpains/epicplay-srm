@@ -1,4 +1,5 @@
 import { useState, useRef, useEffect, useMemo } from "react";
+import { currentActor } from "./config";
 import { motion, AnimatePresence } from "framer-motion";
 import {
   Search,
@@ -266,6 +267,7 @@ export default function CatalogScreen({
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           action: "toggleSlot",
+          actor: currentActor(),
           gameName: selectedItem.name,
           edition: activeEditionTab,
           email: historyModal.login,
@@ -314,6 +316,7 @@ export default function CatalogScreen({
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           action: "updateAccountExpense",
+          actor: currentActor(),
           login: accountModal.login,
           gameName: selectedItem?.name,
           edition: activeEditionTab,
@@ -445,6 +448,7 @@ export default function CatalogScreen({
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           action: "addEdition",
+          actor: currentActor(),
           gameName: selectedItem.name,
           type: selectedItem.type,
           edition: newEditionName.trim(),
@@ -540,6 +544,7 @@ export default function CatalogScreen({
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           action: "updateGame",
+          actor: currentActor(),
           id: selectedItem.id,
           name,
           coverUrl: cover,
@@ -621,6 +626,7 @@ export default function CatalogScreen({
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           action: "addAccount",
+          actor: currentActor(),
           gameName: selectedItem.name,
           edition: newAccountEdition,
           login: newAccountLogin.trim(),

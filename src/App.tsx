@@ -4,7 +4,7 @@ import {Menu, Gamepad2, Plus, Copy, User, LockKeyhole} from "lucide-react";
 import CatalogScreen from "./CatalogScreen";
 import EmptyAccountsScreen from "./EmptyAccountsScreen";
 import AddOrderModal from "./AddOrderModal";
-import OrdersHistoryScreen from "./OrdersHistoryScreen";
+import ActivityScreen from "./ActivityScreen";
 import {API_URL} from "./config";
 
 function AuthWall({onLoginSuccess}: { onLoginSuccess: (user: any) => void }) {
@@ -253,8 +253,7 @@ export default function App() {
 
             {currentScreen === "profile" && currentScreen !== "add_order" && (
                 authUser.role === "admin" ? (
-                    <OrdersHistoryScreen
-                        variables={variables}
+                    <ActivityScreen
                         API_URL={API_URL}
                         footer={
                             <div

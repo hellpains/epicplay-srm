@@ -1,4 +1,5 @@
 import { useState, useEffect, useMemo } from "react";
+import { currentActor } from "./config";
 import { motion, AnimatePresence, useAnimation } from "framer-motion";
 import { Copy, Check, RotateCw, Gamepad2, Trash2, X, Plus } from "lucide-react";
 
@@ -75,7 +76,7 @@ export default function EmptyAccountsScreen({
       try {
         await fetch(API_URL, {
           method: "POST",
-          body: JSON.stringify({ action: "markProblem", email: email }),
+          body: JSON.stringify({ action: "markProblem", actor: currentActor(), email: email }),
         });
       } catch (error) {
         console.error("Ошибка при переносе в корзину:", error);
@@ -95,7 +96,7 @@ export default function EmptyAccountsScreen({
       try {
         await fetch(API_URL, {
           method: "POST",
-          body: JSON.stringify({ action: "unmarkProblem", email: email }),
+          body: JSON.stringify({ action: "unmarkProblem", actor: currentActor(), email: email }),
         });
       } catch (error) {
         console.error("Ошибка при восстановлении:", error);
@@ -132,6 +133,7 @@ export default function EmptyAccountsScreen({
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           action: "addEmptyAccount",
+          actor: currentActor(),
           email,
           region: newRegion,
         }),

@@ -356,6 +356,12 @@ async function handleAddGame(data: any) {
 
   if (error) return json({ error: error.message });
 
+  await logActivity("game", isSub ? "Добавлена подписка" : "Добавлена игра", {
+    details: editions.length ? `${name} · ${editions.join(", ")}` : name,
+    gameName: name,
+    actor: data.actor,
+  });
+
   await sendTG(
     "🎮 <b>ДОБАВЛЕНА НОВАЯ " + (isSub ? "ПОДПИСКА" : "ИГРА") +
       "</b>\n\nНазвание: " + name,
@@ -381,6 +387,12 @@ async function handleBackfillCovers() {
     } else {
       failed.push(row.name ?? "");
     }
+  }
+
+  if (updated > 0) {
+    await logActivity("game", "Подтянуты обложки", {
+      details: `Обновлено: ${updated}`,
+    });
   }
 
   return json({ success: true, updated, failed });
@@ -415,6 +427,12 @@ async function handleAddEdition(data: any) {
     .eq("id", row.id);
 
   if (error) return json({ error: error.message });
+
+  await logActivity("game", "Добавлено издание", {
+    details: gameLabel(name, newEdition),
+    gameName: name,
+    actor: data.actor,
+  });
   return json({ success: true });
 }
 
@@ -441,6 +459,14 @@ async function handleAddAccount(data: any) {
   await clearEmptyAccount(data.login);
 
   const total = fiat * rate;
+  await logActivity("account", "Добавлен аккаунт", {
+    details: gameLabel(data.gameName, data.edition) +
+      (total ? ` · расход ${Math.round(total)} ₽` : ""),
+    login: data.login,
+    gameName: data.gameName,
+    actor: data.actor || data.employee,
+  });
+
   let msg = "🆕 <b>Новый аккаунт</b>\n\n";
   msg += "🎮 <b>Игра:</b> " + data.gameName + " (" + data.edition + ")\n";
   msg += "✉️ <b>Логин:</b> " + data.login + "\n";
@@ -503,6 +529,17 @@ async function handleAddOrder(data: any) {
   }
 
   const isReturn = String(data.slot).toLowerCase().indexOf("возврат") !== -1;
+  const orderPrice = Number(String(data.price ?? "").replace(",", "."));
+  await logActivity("order", isReturn ? "Возврат" : "Новый заказ", {
+    details: [gameLabel(data.gameName, data.edition), data.slot, data.client]
+      .filter(Boolean)
+      .join(" · "),
+    login: data.login,
+    gameName: data.gameName,
+    actor: data.actor || data.employee,
+    price: data.price === "" || isNaN(orderPrice) ? null : orderPrice,
+  });
+
   let msg = "🛒 <b>" + (isReturn ? "ОФОРМЛЕН ВОЗВРАТ" : "НОВЫЙ ЗАКАЗ") + "</b>\n\n";
   msg += "👤 <b>Клиент:</b> " + data.client + "\n";
   msg += "🎮 <b>Игра:</b> " + data.gameName + " (" + data.edition + ")\n";
@@ -539,9 +576,46 @@ async function handleGetSlotHistory(data: any) {
   return json({ success: true, history });
 }
 
-const ORDERS_PAGE_SIZE = 50;
+const ACTIVITY_PAGE_SIZE = 50;
 
-function applyOrderFilters(q: any, data: any) {
+// Пишет событие в журнал. Ошибка журнала не должна ломать само действие.
+async function logActivity(
+  type: string,
+  title: string,
+  fields: {
+    details?: string;
+    login?: string;
+    gameName?: string;
+    actor?: string;
+    price?: number | null;
+  } = {},
+) {
+  try {
+    await db.from("activity_log").insert({
+      type,
+      title,
+      details: fields.details ?? "",
+      login: (fields.login ?? "").toString().trim(),
+      game_name: fields.gameName ?? "",
+      actor: (fields.actor ?? "").toString().trim(),
+      price: fields.price ?? null,
+    });
+  } catch (_e) {
+    return;
+  }
+}
+
+function gameLabel(gameName: string, edition?: string) {
+  return edition ? `${gameName} (${edition})` : gameName;
+}
+
+async function handleGetActivity(data: any) {
+  const offset = Math.max(0, Number(data.offset) || 0);
+
+  let q = db
+    .from("activity_log")
+    .select("id, type, title, details, login, game_name, actor, price, created_at");
+
   const search = (data.search ?? "")
     .toString()
     .trim()
@@ -550,77 +624,33 @@ function applyOrderFilters(q: any, data: any) {
   if (search) {
     const p = `%${search}%`;
     q = q.or(
-      `client.ilike.${p},login.ilike.${p},game_name.ilike.${p}`,
+      `title.ilike.${p},details.ilike.${p},login.ilike.${p},game_name.ilike.${p},actor.ilike.${p}`,
     );
   }
+  if (data.type && data.type !== "all") q = q.eq("type", data.type);
 
-  if (data.employee) q = q.eq("employee", data.employee);
-  if (data.from) q = q.gte("created_at", data.from);
-  if (data.to) q = q.lt("created_at", data.to);
+  const { data: rows, error } = await q
+    .order("created_at", { ascending: false })
+    .range(offset, offset + ACTIVITY_PAGE_SIZE - 1);
 
-  const kind = (data.kind ?? "all").toString();
-  if (kind === "manual") {
-    q = q.in("event", ["manual_free", "manual_occupy"]);
-  } else {
-    q = q.eq("event", "");
-    if (kind === "orders") q = q.not("slot", "ilike", "%возврат%");
-    if (kind === "returns") q = q.ilike("slot", "%возврат%");
-  }
-  return q;
-}
+  if (error) return json({ success: false, error: error.message });
 
-async function handleGetOrders(data: any) {
-  const offset = Math.max(0, Number(data.offset) || 0);
-
-  const [pageRes, totalsRes] = await Promise.all([
-    applyOrderFilters(
-      db
-        .from("orders")
-        .select(
-          "id, login, game_name, edition, client, slot, price, payment_method, employee, event, created_at",
-        ),
-      data,
-    )
-      .order("created_at", { ascending: false })
-      .range(offset, offset + ORDERS_PAGE_SIZE - 1),
-    applyOrderFilters(db.from("orders").select("slot, price, event"), data),
-  ]);
-
-  if (pageRes.error) return json({ success: false, error: pageRes.error.message });
-
-  let revenue = 0;
-  let refunds = 0;
-  let count = 0;
-  for (const r of totalsRes.data ?? []) {
-    count++;
-    if (r.event) continue;
-    const price = Number(r.price ?? 0);
-    if (String(r.slot ?? "").toLowerCase().includes("возврат")) {
-      refunds += Math.abs(price);
-    } else {
-      revenue += price;
-    }
-  }
-
-  const orders = (pageRes.data ?? []).map((r: any) => ({
+  const events = (rows ?? []).map((r: any) => ({
     id: r.id,
+    type: r.type,
+    title: r.title,
+    details: r.details ?? "",
     login: r.login ?? "",
     gameName: r.game_name ?? "",
-    edition: r.edition ?? "",
-    client: r.client ?? "",
-    slot: r.slot ?? "",
+    actor: r.actor ?? "",
     price: r.price,
-    paymentMethod: r.payment_method ?? "",
-    employee: r.employee ?? "",
-    event: r.event ?? "",
     createdAt: r.created_at,
   }));
 
   return json({
     success: true,
-    orders,
-    hasMore: orders.length === ORDERS_PAGE_SIZE,
-    totals: { count, revenue, refunds, net: revenue - refunds },
+    events,
+    hasMore: events.length === ACTIVITY_PAGE_SIZE,
   });
 }
 
@@ -677,6 +707,25 @@ async function handleUpdateGame(data: any) {
       .from("orders")
       .update({ game_name: newName })
       .eq("game_name", oldName);
+  }
+
+  const changes: string[] = [];
+  if (newName !== oldName) changes.push(`название: ${oldName} → ${newName}`);
+  if (editions.join("|") !== (existing.editions ?? []).join("|")) {
+    changes.push(`издания: ${editions.join(", ")}`);
+  }
+  if (coverUrl !== existing.cover_url) changes.push("обложка");
+  if (hasPS5 !== existing.has_ps5 || hasPS4 !== existing.has_ps4) {
+    changes.push(
+      "платформы: " + [hasPS5 && "PS5", hasPS4 && "PS4"].filter(Boolean).join(", "),
+    );
+  }
+  if (changes.length > 0) {
+    await logActivity("game", "Изменена игра", {
+      details: `${newName} · ${changes.join("; ")}`,
+      gameName: newName,
+      actor: data.actor,
+    });
   }
 
   return json({ success: true });
@@ -740,6 +789,15 @@ async function handleUpdateAccountExpense(data: any) {
   const { error } = await q;
   if (error) return json({ success: false, error: error.message });
 
+  await logActivity("account", "Изменён расход аккаунта", {
+    details: [data.gameName && gameLabel(data.gameName, data.edition), `${value} ₽`]
+      .filter(Boolean)
+      .join(" · "),
+    login,
+    gameName: data.gameName ?? "",
+    actor: data.actor,
+  });
+
   return json({ success: true });
 }
 
@@ -771,6 +829,19 @@ async function handleToggleSlot(data: any) {
     created_at: new Date().toISOString(),
   });
 
+  await logActivity(
+    "slot",
+    occupied ? "Слот занят вручную" : "Слот освобождён вручную",
+    {
+      details: [gameLabel(data.gameName ?? "", data.edition), baseSlot]
+        .filter(Boolean)
+        .join(" · "),
+      login: data.email,
+      gameName: data.gameName ?? "",
+      actor: data.actor,
+    },
+  );
+
   return json({ success: true });
 }
 
@@ -793,6 +864,11 @@ async function handleAddEmptyAccount(data: any) {
       .update({ region, status: "Свободен", is_problem: false })
       .eq("id", existing.id);
     if (error) return json({ success: false, error: error.message });
+    await logActivity("empty", "Пустой аккаунт обновлён", {
+      details: region,
+      login: email,
+      actor: data.actor,
+    });
     return json({ success: true });
   }
 
@@ -801,6 +877,11 @@ async function handleAddEmptyAccount(data: any) {
     .insert({ email, region, status: "Свободен", is_problem: false });
 
   if (error) return json({ success: false, error: error.message });
+  await logActivity("empty", "Добавлен пустой аккаунт", {
+    details: region,
+    login: email,
+    actor: data.actor,
+  });
   return json({ success: true });
 }
 
@@ -817,6 +898,12 @@ async function handleMarkProblem(data: any, value: boolean) {
     .from("empty_accounts")
     .update({ is_problem: value })
     .eq("id", rows[0].id);
+
+  await logActivity(
+    "empty",
+    value ? "Пустой аккаунт перенесён в корзину" : "Пустой аккаунт восстановлен из корзины",
+    { login: data.email, actor: data.actor },
+  );
   return json({ success: true });
 }
 
@@ -865,8 +952,8 @@ Deno.serve(async (req) => {
           return await handleAddOrder(data);
         case "getSlotHistory":
           return await handleGetSlotHistory(data);
-        case "getOrders":
-          return await handleGetOrders(data);
+        case "getActivity":
+          return await handleGetActivity(data);
         case "getAccountInfo":
           return await handleGetAccountInfo(data);
         case "updateAccountExpense":

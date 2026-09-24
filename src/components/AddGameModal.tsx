@@ -1,4 +1,5 @@
 import React, { useState, useRef, useEffect } from "react";
+import { currentActor } from "../config";
 import { motion, AnimatePresence } from "framer-motion";
 import { X, Plus, Trash2, Check } from "lucide-react";
 
@@ -154,6 +155,7 @@ export default function AddGameModal({
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           action: "addGame",
+          actor: currentActor(),
           type: kind,
           name: trimmedTitle,
           editions: validEditions,

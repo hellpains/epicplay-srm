@@ -1,4 +1,5 @@
 import React, { useState, useRef, useEffect, useMemo } from "react";
+import { currentActor } from "./config";
 import { motion, AnimatePresence } from "framer-motion";
 import { X, Check, ChevronDown } from "lucide-react";
 
@@ -316,6 +317,7 @@ const handleSubmit = (e?: React.FormEvent) => {
     try {
       const requestPayload: any = {
         action: orderType === "Шеринг аккаунт" ? "addAccount" : "addOrder",
+        actor: currentActor(),
         login: login.trim(),
         gameName: selectedGame.name,
         edition: selectedEdition,
