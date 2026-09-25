@@ -97,6 +97,7 @@ export default function CatalogScreen({
   const [showPrices, setShowPrices] = useState(false);
   const [copyStatus, setCopyStatus] = useState(null);
   const [isModalOpen, setIsModalOpen] = useState(false);
+  const [catalogMode, setCatalogMode] = useState<"шеринг" | "стандарт">("шеринг");
   const [categoryTab, setCategoryTab] = useState("игры");
   const [isSearchActive, setIsSearchActive] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
@@ -784,60 +785,82 @@ export default function CatalogScreen({
           <div className="flex bg-neutral-800/50 backdrop-blur-md p-1.5 rounded-2xl border border-neutral-800 relative">
             <div
               className={`absolute inset-y-1.5 left-1.5 w-[calc(50%-6px)] bg-neutral-700 rounded-xl transition-transform duration-200 ease-out ${
-                categoryTab === "подписки"
+                catalogMode === "стандарт"
                   ? "translate-x-full"
                   : "translate-x-0"
               }`}
             />
             <motion.button
-              onTap={() => setCategoryTab("игры")}
+              onTap={() => setCatalogMode("шеринг")}
               style={{ WebkitTapHighlightColor: "transparent" }}
               className={`cursor-pointer touch-manipulation select-none relative z-10 flex-1 py-2.5 text-sm font-semibold transition-colors ${
+                catalogMode === "шеринг" ? "text-white" : "text-neutral-500"
+              }`}
+            >
+              Шеринг
+            </motion.button>
+            <motion.button
+              onTap={() => setCatalogMode("стандарт")}
+              style={{ WebkitTapHighlightColor: "transparent" }}
+              className={`cursor-pointer touch-manipulation select-none relative z-10 flex-1 py-2.5 text-sm font-semibold transition-colors ${
+                catalogMode === "стандарт" ? "text-white" : "text-neutral-500"
+              }`}
+            >
+              Стандарт
+            </motion.button>
+          </div>
+        </div>
+
+        {catalogMode === "шеринг" ? (
+        <>
+        <div className="flex justify-between items-center px-6 mb-5">
+          <div className="flex items-center gap-2 pl-1">
+            <motion.button
+              onTap={() => setCategoryTab("игры")}
+              style={{ WebkitTapHighlightColor: "transparent" }}
+              className={`cursor-pointer touch-manipulation select-none py-2 text-[15px] font-medium transition-colors ${
                 categoryTab === "игры" ? "text-white" : "text-neutral-500"
               }`}
             >
               Игры
             </motion.button>
+            <span className="text-neutral-600 text-[15px]">·</span>
             <motion.button
               onTap={() => setCategoryTab("подписки")}
               style={{ WebkitTapHighlightColor: "transparent" }}
-              className={`cursor-pointer touch-manipulation select-none relative z-10 flex-1 py-2.5 text-sm font-semibold transition-colors ${
+              className={`cursor-pointer touch-manipulation select-none py-2 text-[15px] font-medium transition-colors ${
                 categoryTab === "подписки" ? "text-white" : "text-neutral-500"
               }`}
             >
               Подписки
             </motion.button>
           </div>
-        </div>
 
-        <div className="flex justify-between items-center px-6 mb-5">
-          <motion.button
-            onTap={() =>
-              setSortBy(sortBy === "alphabet" ? "popularity" : "alphabet")
-            }
-            whileTap={{ scale: 0.95 }}
-            style={{ WebkitTapHighlightColor: "transparent" }}
-            className="cursor-pointer touch-manipulation select-none flex items-center gap-2 pl-1 py-2 rounded-full transition-all"
-          >
-            <ArrowUpDown size={14} className="text-green-500" />
-            <span className="text-[13px] font-regular text-neutral-400">
-              {sortBy === "alphabet" ? "по алфавиту" : "популярные"}
-            </span>
-          </motion.button>
-          
-          <motion.button
-            onTap={() => setIsModalOpen(true)}
-            whileTap={{ scale: 0.95 }}
-            style={{ WebkitTapHighlightColor: "transparent" }}
-            className="cursor-pointer touch-manipulation select-none flex items-center gap-2 pl-3.5 pr-1 py-1 border border-green-500/30 bg-green-500/5 rounded-full transition-all"
-          >
-            <span className="text-[13px] font-normal text-white/70">
-              {categoryTab === "подписки" ? "Добавить" : "Добавить игру"}
-            </span>
-            <div className="w-6 h-6 bg-green-500 rounded-full flex items-center justify-center shadow-[0_0_8px_rgba(18,200,59,0.25)]">
-              <Plus size={14} strokeWidth={2.5} className="text-black" />
-            </div>
-          </motion.button>
+          <div className="flex items-center gap-2">
+            <motion.button
+              onTap={() =>
+                setSortBy(sortBy === "alphabet" ? "popularity" : "alphabet")
+              }
+              whileTap={{ scale: 0.95 }}
+              style={{ WebkitTapHighlightColor: "transparent" }}
+              className="cursor-pointer touch-manipulation select-none flex items-center gap-1.5 h-9 px-3.5 rounded-full border border-white/10 bg-neutral-800/50 transition-all"
+            >
+              <ArrowUpDown size={14} className="text-green-500" />
+              <span className="text-[13px] font-normal text-white/80">
+                {sortBy === "alphabet" ? "A–Z" : "top"}
+              </span>
+            </motion.button>
+
+            <motion.button
+              onTap={() => setIsModalOpen(true)}
+              whileTap={{ scale: 0.95 }}
+              style={{ WebkitTapHighlightColor: "transparent" }}
+              aria-label={categoryTab === "подписки" ? "Добавить подписку" : "Добавить игру"}
+              className="cursor-pointer touch-manipulation select-none w-9 h-9 flex items-center justify-center border border-green-500/60 bg-green-500/5 rounded-full transition-all"
+            >
+              <Plus size={18} strokeWidth={2.2} className="text-green-500" />
+            </motion.button>
+          </div>
         </div>
 
         <div className="grid grid-cols-2 gap-4 px-6 pb-10">
@@ -879,6 +902,12 @@ export default function CatalogScreen({
             <span className="text-[12px] font-medium tracking-[0.1em] text-neutral-500 px-5 py-2 rounded-full border border-white/10">
               Количество игр: {processedItems.length}
             </span>
+          </div>
+        )}
+        </>
+        ) : (
+          <div className="px-6 py-16 text-center text-neutral-500 text-sm">
+            Здесь будут цены на обычные подписки
           </div>
         )}
       </div>
