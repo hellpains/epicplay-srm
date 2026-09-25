@@ -24,6 +24,7 @@ import {
 } from "lucide-react";
 import AddGameModal from "./components/AddGameModal";
 import PriceTable from "./components/PriceTable";
+import StandardPrices from "./components/StandardPrices";
 import { MyLogo } from "./components/MyLogo";
 
 function ResultDialog({
@@ -906,9 +907,11 @@ export default function CatalogScreen({
         )}
         </>
         ) : (
-          <div className="px-6 py-16 text-center text-neutral-500 text-sm">
-            Здесь будут цены на обычные подписки
-          </div>
+          <StandardPrices
+            standardPrices={variables.standardPrices ?? {}}
+            apiUrl={API_URL}
+            onSaved={() => fetchItems(true)}
+          />
         )}
       </div>
 

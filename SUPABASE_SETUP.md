@@ -80,6 +80,7 @@ CRM для шеринга игровых аккаунтов PlayStation (про�
 | `currencies` | Справочник валют с курсом к базовой (₽) |
 | `regions` | Справочник регионов (код + эмодзи-флаг) |
 | `app_users` | Пользователи приложения (авторизация по логину/паролю) |
+| `standard_prices` | Цены обычных подписок (вкладка «Стандарт»): раздел `платформа\|регион\|подписка` → цены в ₽ |
 | `activity_log` | Журнал всех изменений (вкладка «История»): что сделано, ссылка на исходную запись (`ref_id`), данные для отката (`undo`), время последнего действия (`sort_at`) |
 
 **Связи — «мягкие», по строковым полям, без внешних ключей (FK).**
@@ -453,6 +454,7 @@ npx vercel --prod
 | `addEdition` | `gameName, type, edition` | Добавляет издание в массив (макс. 5) |
 | `updateGame` | `id, name, coverUrl, editions[], hasPS5, hasPS4` | Обновляет карточку; при смене `name` переносит `game_name` в `accounts` и `orders` |
 | `updatePrices` | `id, prices{"Издание\|Платформа\|Слот": цена}, actor?` | Сохраняет прайс игры (пустые и нечисловые цены отбрасываются); пишет «Изменены цены» в журнал с возможностью отмены. `{ success, prices }` |
+| `updateStandardPrices` | `key` (`"playstation\|ua\|psplus"`), `label`, `prices{"Essential\|1": цена}` | Сохраняет цены обычной подписки (пустые и нечисловые отбрасываются); пишет «Изменены цены подписок» в журнал с возможностью отмены. `{ success, prices }` |
 | `backfillCovers` | — | Дозаполняет пустые обложки для игр из PS Store. Возвращает `{updated, failed[]}` |
 | `addAccount` | `gameName, edition, login, expense, currency, employee, manualDate?` | Создаёт аккаунт (слоты пустые), убирает из `empty_accounts`, TG |
 | `addOrder` | `login, gameName, edition, client, slot, price, paymentMethod, employee, expense?, currency?, manualDate?` | Пишет заказ; занимает/освобождает слот; если логина ещё нет — создаёт аккаунт; чистит пустые; TG |

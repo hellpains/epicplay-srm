@@ -106,7 +106,7 @@ async function getRate(currency: string) {
 }
 
 async function buildCatalog() {
-  const [catalogRes, accountsRes, emptyRes, empRes, payRes, curRes, regRes] =
+  const [catalogRes, accountsRes, emptyRes, empRes, payRes, curRes, regRes, stdRes] =
     await Promise.all([
       db.from("catalog_items").select("*"),
       db.from("accounts").select("*").order("created_at", { ascending: true }),
@@ -115,6 +115,7 @@ async function buildCatalog() {
       db.from("payment_methods").select("name").order("sort_order"),
       db.from("currencies").select("name").order("sort_order"),
       db.from("regions").select("code, emoji").order("sort_order"),
+      db.from("standard_prices").select("key, prices"),
     ]);
 
   const catalog = catalogRes.data ?? [];
@@ -183,6 +184,9 @@ async function buildCatalog() {
       emoji: r.emoji,
       code: r.code,
     })),
+    standardPrices: Object.fromEntries(
+      (stdRes.data ?? []).map((r: any) => [r.key, r.prices ?? {}]),
+    ),
   };
 
   return { items, emptyAccounts, variables };
@@ -541,6 +545,43 @@ async function handleUpdatePrices(data: any) {
     actor: data.actor,
     refId: g.id,
     undo: { before: g.prices ?? {} },
+  });
+  return json({ success: true, prices });
+}
+
+// Цены обычных подписок. Раздел — "playstation|ua|psplus", ключ цены — "Essential|1"
+const STANDARD_KEY = /^[a-z]+\|[a-z]+\|[a-z]+$/;
+// Ключ цены: "тариф|месяцев" — всё остальное (например, "undefined|undefined") отбрасываем
+const STANDARD_PRICE_KEY = /^[A-Za-z][A-Za-z ]*\|\d+$/;
+
+async function handleUpdateStandardPrices(data: any) {
+  const key = str(data.key);
+  if (!STANDARD_KEY.test(key)) return json({ success: false, error: "Неизвестный раздел" });
+
+  const prices: Record<string, number> = {};
+  for (const [priceKey, value] of Object.entries(data.prices ?? {})) {
+    if (!STANDARD_PRICE_KEY.test(priceKey) || priceKey.startsWith("undefined|")) continue;
+    const price = parsePrice(value);
+    if (price !== null && price > 0) prices[priceKey] = price;
+  }
+
+  const { data: before } = await db
+    .from("standard_prices")
+    .select("prices")
+    .eq("key", key)
+    .maybeSingle();
+  const { data: row, error } = await db
+    .from("standard_prices")
+    .upsert({ key, prices, updated_at: new Date().toISOString() }, { onConflict: "key" })
+    .select("id")
+    .single();
+  if (error) return json({ success: false, error: error.message });
+
+  await logActivity("game", "standard_prices_update", "Изменены цены подписок", {
+    details: str(data.label).slice(0, 100) || key,
+    actor: data.actor,
+    refId: row.id,
+    undo: { before: before?.prices ?? {} },
   });
   return json({ success: true, prices });
 }
@@ -921,6 +962,10 @@ async function activityFields(ev: any): Promise<Record<string, unknown> | null> 
     case "game_update":
     case "prices_update":
       return ev.undo?.before && (await fetchRef("catalog_items", ev.ref_id))
+        ? {}
+        : null;
+    case "standard_prices_update":
+      return ev.undo?.before && (await fetchRef("standard_prices", ev.ref_id))
         ? {}
         : null;
     case "empty_add":
@@ -1419,6 +1464,11 @@ async function undoActivity(
       await updateRow(journal, "catalog_items", g, { prices: ev.undo.before });
       return null;
     }
+    case "standard_prices_update": {
+      const row = await fetchRef("standard_prices", ev.ref_id);
+      await updateRow(journal, "standard_prices", row, { prices: ev.undo.before });
+      return null;
+    }
     case "empty_add": {
       const e = await fetchRef("empty_accounts", ev.ref_id);
       await deleteRows(journal, "empty_accounts", [e]);
@@ -1450,6 +1500,7 @@ const DELETED_TITLES: Record<string, string> = {
   edition_add: "Удалено издание",
   game_update: "Отменено изменение игры",
   prices_update: "Отменено изменение цен",
+  standard_prices_update: "Отменено изменение цен подписок",
   empty_add: "Удалён пустой аккаунт",
   empty_update: "Отменено обновление пустого аккаунта",
   empty_trash: "Отменён перенос в корзину",
@@ -1857,6 +1908,8 @@ Deno.serve(async (req) => {
           return await handleAddEdition(data);
         case "updatePrices":
           return await handleUpdatePrices(data);
+        case "updateStandardPrices":
+          return await handleUpdateStandardPrices(data);
         case "updateGame":
           return await handleUpdateGame(data);
         case "backfillCovers":
