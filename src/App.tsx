@@ -61,6 +61,10 @@ function AuthWall({onLoginSuccess}: { onLoginSuccess: (user: any) => void }) {
                     <input
                         type="text"
                         placeholder="Логин"
+                        autoCapitalize="none"
+                        autoCorrect="off"
+                        spellCheck={false}
+                        autoComplete="username"
                         value={login}
                         onChange={(e) => setLogin(e.target.value)}
                         className="w-full bg-[#1c1c1e] border border-white/10 rounded-xl px-4 py-3.5 text-[16px] text-white outline-none focus:border-[#12c83b]/50 transition-colors"
@@ -69,6 +73,7 @@ function AuthWall({onLoginSuccess}: { onLoginSuccess: (user: any) => void }) {
                     <input
                         type="password"
                         placeholder="Пароль"
+                        autoComplete="current-password"
                         value={password}
                         onChange={(e) => setPassword(e.target.value)}
                         className="w-full bg-[#1c1c1e] border border-white/10 rounded-xl px-4 py-3.5 text-[16px] text-white outline-none focus:border-[#12c83b]/50 transition-colors"

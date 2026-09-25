@@ -11,7 +11,7 @@ const db = createClient(SUPABASE_URL, SERVICE_ROLE_KEY, {
 
 const CORS = {
   "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Headers": "*",
+  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type, x-app-token",
   "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
 };
 
@@ -269,10 +269,12 @@ async function verifyToken(token: string | null): Promise<AuthUser | null> {
 }
 
 async function login(loginValue: string, password: string) {
+  // Без учёта регистра: клавиатура телефона сама делает первую букву заглавной.
+  // % и _ в ilike — спецсимволы, экранируем их.
   const { data } = await db
     .from("app_users")
     .select("login, password, role, name")
-    .eq("login", loginValue)
+    .ilike("login", loginValue.replace(/[\\%_]/g, "\\$&"))
     .maybeSingle();
 
   if (data && String(data.password) === String(password)) {
