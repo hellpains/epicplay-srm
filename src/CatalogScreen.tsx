@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect, useMemo } from "react";
-import { currentActor } from "./config";
+import { apiFetch } from "./config";
 import { motion, AnimatePresence } from "framer-motion";
 import {
   Search,
@@ -23,6 +23,7 @@ import {
   Hand,
 } from "lucide-react";
 import AddGameModal from "./components/AddGameModal";
+import PriceTable from "./components/PriceTable";
 import { MyLogo } from "./components/MyLogo";
 
 function ResultDialog({
@@ -93,6 +94,7 @@ export default function CatalogScreen({
   API_URL,
 }: any) {
   const [activeEditionTab, setActiveEditionTab] = useState("");
+  const [showPrices, setShowPrices] = useState(false);
   const [copyStatus, setCopyStatus] = useState(null);
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [categoryTab, setCategoryTab] = useState("игры");
@@ -188,9 +190,10 @@ export default function CatalogScreen({
     }
 
     const updatedItem = { ...item, editions: originalEditions };
-    
+
     setSelectedItem(updatedItem);
-    setActiveEditionTab(defaultTab); 
+    setActiveEditionTab(defaultTab);
+    setShowPrices(false);
 
     if (searchQuery) {
       const query = searchQuery.toLowerCase().trim();
@@ -230,7 +233,7 @@ export default function CatalogScreen({
     });
 
     try {
-      const response = await fetch(API_URL, {
+      const response = await apiFetch(API_URL, {
         method: "POST",
         body: JSON.stringify({ action: "getSlotHistory", login }),
       });
@@ -262,12 +265,11 @@ export default function CatalogScreen({
     setIsTogglingSlot(true);
 
     try {
-      const response = await fetch(API_URL, {
+      const response = await apiFetch(API_URL, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           action: "toggleSlot",
-          actor: currentActor(),
           gameName: selectedItem.name,
           edition: activeEditionTab,
           email: historyModal.login,
@@ -311,12 +313,11 @@ export default function CatalogScreen({
     setIsSavingSpent(true);
 
     try {
-      const response = await fetch(API_URL, {
+      const response = await apiFetch(API_URL, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           action: "updateAccountExpense",
-          actor: currentActor(),
           login: accountModal.login,
           gameName: selectedItem?.name,
           edition: activeEditionTab,
@@ -354,7 +355,7 @@ export default function CatalogScreen({
     setAccountModal({ login, data: null, isLoading: true });
 
     try {
-      const response = await fetch(API_URL, {
+      const response = await apiFetch(API_URL, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ action: "getAccountInfo", login }),
@@ -442,13 +443,12 @@ export default function CatalogScreen({
     setIsSubmittingEdition(true);
 
     try {
-      await fetch(API_URL, {
+      await apiFetch(API_URL, {
         method: "POST",
         mode: "no-cors",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           action: "addEdition",
-          actor: currentActor(),
           gameName: selectedItem.name,
           type: selectedItem.type,
           edition: newEditionName.trim(),
@@ -539,12 +539,11 @@ export default function CatalogScreen({
 
     try {
       const cover = settingsCover.trim();
-      const response = await fetch(API_URL, {
+      const response = await apiFetch(API_URL, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           action: "updateGame",
-          actor: currentActor(),
           id: selectedItem.id,
           name,
           coverUrl: cover,
@@ -620,13 +619,12 @@ export default function CatalogScreen({
     setIsSubmittingAccount(true);
 
     try {
-      await fetch(API_URL, {
+      await apiFetch(API_URL, {
         method: "POST",
         mode: "no-cors",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           action: "addAccount",
-          actor: currentActor(),
           gameName: selectedItem.name,
           edition: newAccountEdition,
           login: newAccountLogin.trim(),
@@ -916,7 +914,10 @@ export default function CatalogScreen({
                 <div className="absolute inset-x-0 bottom-0 h-24 bg-gradient-to-t from-[#121212] to-transparent" />
               </div>
 
-              <div className="relative w-full h-32 z-50">
+              <div
+                className="relative w-full z-50"
+                style={{ height: "calc(env(safe-area-inset-top, 24px) + 68px)" }}
+              >
                 <div
                   className="absolute inset-x-0 z-50 flex items-center px-5 gap-2 h-10"
                   style={{ top: "calc(env(safe-area-inset-top, 24px) + 8px)" }}
@@ -937,11 +938,18 @@ export default function CatalogScreen({
 
                   <div className="flex-1 h-10 relative">
                     {!isSearchActive && (
-                      <div className="absolute left-0 top-0 h-10 px-4 rounded-[20px] bg-black/40 backdrop-blur-md flex items-center shadow-lg border border-white/10 w-auto max-w-[calc(100%-96px)]">
+                      <motion.button
+                        onTap={() => setShowPrices((v) => !v)}
+                        whileTap={{ scale: 0.95 }}
+                        style={{ WebkitTapHighlightColor: "transparent" }}
+                        className={`cursor-pointer touch-manipulation select-none absolute left-0 top-0 h-10 px-4 rounded-[20px] backdrop-blur-md flex items-center shadow-lg border w-auto max-w-[calc(100%-96px)] transition-colors ${
+                          showPrices ? "bg-white/15 border-white/25" : "bg-black/40 border-white/10"
+                        }`}
+                      >
                         <h2 className="text-[15px] font-medium text-white/95 whitespace-nowrap truncate">
                           {selectedItem.title || selectedItem.name}
                         </h2>
-                      </div>
+                      </motion.button>
                     )}
 
                     <div className="absolute right-0 top-0 bottom-0 flex items-center justify-end left-0 pointer-events-none">
@@ -1001,6 +1009,26 @@ export default function CatalogScreen({
                   </div>
                 </div>
               </div>
+
+              <AnimatePresence initial={false}>
+                {showPrices && (
+                  <motion.div
+                    initial={{ opacity: 0, height: 0 }}
+                    animate={{ opacity: 1, height: "auto" }}
+                    exit={{ opacity: 0, height: 0 }}
+                    transition={{ duration: 0.2 }}
+                    className="px-6 relative z-10 overflow-hidden"
+                  >
+                    <div className="pb-3">
+                      <PriceTable
+                        item={selectedItem}
+                        API_URL={API_URL}
+                        onSaved={() => fetchItems(true)}
+                      />
+                    </div>
+                  </motion.div>
+                )}
+              </AnimatePresence>
 
               <div className="px-6 relative z-10">
                 <div className="flex bg-black/40 backdrop-blur-md p-1.5 rounded-[18px] border border-white/5 relative">

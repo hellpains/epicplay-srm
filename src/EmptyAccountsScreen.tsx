@@ -1,5 +1,5 @@
 import { useState, useEffect, useMemo } from "react";
-import { currentActor } from "./config";
+import { apiFetch } from "./config";
 import { motion, AnimatePresence, useAnimation } from "framer-motion";
 import { Copy, Check, RotateCw, Gamepad2, Trash2, X, Plus } from "lucide-react";
 
@@ -74,9 +74,9 @@ export default function EmptyAccountsScreen({
     setSwipedItemId(null);
     if (API_URL) {
       try {
-        await fetch(API_URL, {
+        await apiFetch(API_URL, {
           method: "POST",
-          body: JSON.stringify({ action: "markProblem", actor: currentActor(), email: email }),
+          body: JSON.stringify({ action: "markProblem", email: email }),
         });
       } catch (error) {
         console.error("Ошибка при переносе в корзину:", error);
@@ -94,9 +94,9 @@ export default function EmptyAccountsScreen({
     }
     if (API_URL) {
       try {
-        await fetch(API_URL, {
+        await apiFetch(API_URL, {
           method: "POST",
-          body: JSON.stringify({ action: "unmarkProblem", actor: currentActor(), email: email }),
+          body: JSON.stringify({ action: "unmarkProblem", email: email }),
         });
       } catch (error) {
         console.error("Ошибка при восстановлении:", error);
@@ -128,12 +128,11 @@ export default function EmptyAccountsScreen({
     setAddError("");
 
     try {
-      const response = await fetch(API_URL, {
+      const response = await apiFetch(API_URL, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           action: "addEmptyAccount",
-          actor: currentActor(),
           email,
           region: newRegion,
         }),

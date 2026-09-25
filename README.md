@@ -62,12 +62,13 @@ mrcrm-app/
 │   └── components/AddGameModal.tsx
 └── supabase/
     ├── config.toml           # verify_jwt=false для функции api
-    ├── migrations/0001_init.sql   # таблицы + триггеры + RLS + сиды
+    ├── migrations/                # схема БД: 0001_init.sql + доработки, применять по порядку
     └── functions/api/index.ts     # весь бэкенд (единый эндпоинт /functions/v1/api)
 ```
 
-Аутентификация: экран входа `AuthWall` (`src/App.tsx`) шлёт `GET ?action=login`,
-функция сверяет логин/пароль с таблицей `app_users`, сессия — в `localStorage`.
+Аутентификация: экран входа `AuthWall` (`src/App.tsx`) шлёт `POST {action:"login"}`,
+функция сверяет логин/пароль с таблицей `app_users` и выдаёт токен; фронт хранит его в
+`localStorage` и отправляет в заголовке `x-app-token` через `apiFetch` (`src/config.ts`).
 Детали и предупреждения по безопасности — в
 [`SUPABASE_SETUP.md` §3.6](SUPABASE_SETUP.md).
 
@@ -133,12 +134,13 @@ Personal access token (`sbp_...`) — доступ ко **всему** акка�
 - **Весь бэкенд:** `supabase/functions/api/index.ts`. Полный список действий и их
   контракты — в [`SUPABASE_SETUP.md` §12](SUPABASE_SETUP.md) (там всегда актуальный
   перечень; не дублируй его здесь, чтобы не разошлось).
-- **Схема БД:** `supabase/migrations/0001_init.sql`, подробно расписана в
+- **Схема БД:** `supabase/migrations/` (все файлы по порядку номеров), подробно расписана в
   [`SUPABASE_SETUP.md` §2–§4](SUPABASE_SETUP.md). Модель слотов: `slot1/slot2`=PS5 П3,
   `slot3`=PS5 П2/П2, `slot4`=PS4 П3, `slot5`=PS4 П2.
 - **Расход:** генерируемая колонка `accounts.expense_total = expense_fiat * rate`.
 - **Доступ:** Edge Function работает под `service_role` (обходит RLS); фронт ходит
-  без JWT (`verify_jwt=false`). Прямых запросов из браузера в таблицы нет.
+  без Supabase JWT (`verify_jwt=false`), но с токеном приложения в `x-app-token` — все запросы
+  идут через `apiFetch`. Прямых запросов из браузера в таблицы нет.
 - **Инварианты при правках:** сохранять JSON-контракт ответов, на который завязан
   фронт: `items[].accountDetails[edition][] = {email, slots:[{isOccupied}×5]}`,
   `emptyAccounts[] = {email, region, isProblem}`,

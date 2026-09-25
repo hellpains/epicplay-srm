@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect } from "react";
-import { currentActor } from "../config";
+import { apiFetch } from "../config";
 import { motion, AnimatePresence } from "framer-motion";
 import { X, Plus, Trash2, Check } from "lucide-react";
 
@@ -149,13 +149,12 @@ export default function AddGameModal({
     setIsSubmitting(true);
 
     try {
-      await fetch(API_URL, {
+      await apiFetch(API_URL, {
         method: "POST",
         mode: "no-cors",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           action: "addGame",
-          actor: currentActor(),
           type: kind,
           name: trimmedTitle,
           editions: validEditions,

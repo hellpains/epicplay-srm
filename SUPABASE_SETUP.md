@@ -37,7 +37,7 @@ CRM для шеринга игровых аккаунтов PlayStation (про�
 
 | Что | Где |
 |-----|-----|
-| Схема БД (таблицы, индексы, триггеры, сиды) | `supabase/migrations/0001_init.sql` |
+| Схема БД (таблицы, индексы, триггеры, сиды) | `supabase/migrations/` — все файлы по порядку номеров (`0001_init.sql` — базовая схема, следующие — доработки) |
 | Вся серверная логика (API) | `supabase/functions/api/index.ts` |
 | Конфиг функции (отключён JWT) | `supabase/config.toml` |
 | Как фронт формирует URL API | `src/config.ts` |
@@ -52,7 +52,8 @@ CRM для шеринга игровых аккаунтов PlayStation (про�
    - `anon / publishable key`
    - `project ref` (часть поддомена, `xxxx`)
    - авторизацию CLI: `npx supabase login` (интерактивно в его терминале) **или** personal access token.
-2. **Применить схему** — выполнить `supabase/migrations/0001_init.sql` на его проекте (см. §5).
+2. **Применить схему** — выполнить **все** файлы из `supabase/migrations/` по порядку номеров
+   на его проекте (см. §5). Без поздних миграций не работают история изменений и прайс.
 3. **Секреты функции** — TG_TOKEN / TG_CHAT_ID (опционально). `SUPABASE_URL` и
    `SUPABASE_SERVICE_ROLE_KEY` Supabase подставляет в Edge Functions **автоматически** — вручную не нужны (см. §6).
 4. **Задеплоить Edge Function `api`** (см. §7). Важно: `verify_jwt = false`.
@@ -79,6 +80,7 @@ CRM для шеринга игровых аккаунтов PlayStation (про�
 | `currencies` | Справочник валют с курсом к базовой (₽) |
 | `regions` | Справочник регионов (код + эмодзи-флаг) |
 | `app_users` | Пользователи приложения (авторизация по логину/паролю) |
+| `activity_log` | Журнал всех изменений (вкладка «История»): что сделано, ссылка на исходную запись (`ref_id`), данные для отката (`undo`), время последнего действия (`sort_at`) |
 
 **Связи — «мягкие», по строковым полям, без внешних ключей (FK).**
 `accounts.game_name` / `orders.game_name` ссылаются на `catalog_items.name` по совпадению строки
@@ -101,6 +103,7 @@ CRM для шеринга игровых аккаунтов PlayStation (про�
 | `has_ps4` | boolean | `true` | Есть ли платформа PS4 |
 | `cover_url` | text | `''` | URL обложки |
 | `editions` | text[] | `'{}'` | Массив изданий (напр. `{Standard, Deluxe}`), максимум 5 |
+| `prices` | jsonb | `'{}'` | Прайс: ключ `"Издание\|PS5\|П3"` → цена в ₽ |
 | `created_at` / `updated_at` | timestamptz | `now()` | Метки времени (`updated_at` через триггер) |
 
 Ограничение уникальности: `unique (type, name)` — нельзя две игры с одинаковым именем в одной категории
@@ -185,6 +188,13 @@ CRM для шеринга игровых аккаунтов PlayStation (про�
 > под service_role), но всё равно **смените дефолтный пароль** и по возможности используйте несложные,
 > но уникальные значения. Для продакшена стоит перейти на хеширование.
 
+**Сессии.** При входе функция выдаёт токен (HMAC-SHA256, живёт 30 дней), фронт хранит его в
+`localStorage` и шлёт в заголовке `x-app-token` с каждым запросом. Без действующего токена функция
+отвечает `401`, и приложение показывает экран входа. Токен подписан секретом `AUTH_SECRET`
+(если не задан — `SUPABASE_SERVICE_ROLE_KEY`) и содержит отпечаток пароля: **смена пароля в
+`app_users` сразу обнуляет все выданные токены** этого пользователя. Журнал изменений
+(`getActivity*`, `updateActivity`, `deleteActivity`, `restoreActivity`) доступен только роли `admin`.
+
 ### 3.7 RLS и триггеры
 
 - **RLS включён на ВСЕХ таблицах, политик нет.** Значит: доступ есть только у `service_role`
@@ -225,7 +235,8 @@ CRM для шеринга игровых аккаунтов PlayStation (про�
 
 ## 5. Схема БД (полный SQL)
 
-Канонический источник — `supabase/migrations/0001_init.sql`. Применить можно любым способом:
+Канонический источник — папка `supabase/migrations/`: файлы применяются по порядку номеров,
+каждый следующий дополняет предыдущие. Применить можно любым способом:
 
 **Способ 1 — Supabase CLI (рекомендуется):**
 ```bash
@@ -234,17 +245,19 @@ npx supabase link --project-ref <PROJECT_REF>
 npx supabase db push        # применит миграции из supabase/migrations
 ```
 
-**Способ 2 — Dashboard SQL Editor:** открой SQL Editor проекта и вставь целиком содержимое
-`supabase/migrations/0001_init.sql`, выполни.
+**Способ 2 — Dashboard SQL Editor:** открой SQL Editor проекта и по очереди, в порядке номеров,
+вставь и выполни содержимое каждого файла из `supabase/migrations/`.
 
 **Способ 3 — Management API** (нужен personal access token `sbp_...`):
 ```bash
-curl -s -X POST "https://api.supabase.com/v1/projects/<PROJECT_REF>/database/query" \
-  -H "Authorization: Bearer <sbp_TOKEN>" -H "Content-Type: application/json" \
-  --data-binary @<(jq -Rs '{query: .}' supabase/migrations/0001_init.sql)
+for f in supabase/migrations/*.sql; do
+  curl -s -X POST "https://api.supabase.com/v1/projects/<PROJECT_REF>/database/query" \
+    -H "Authorization: Bearer <sbp_TOKEN>" -H "Content-Type: application/json" \
+    --data-binary @<(jq -Rs '{query: .}' "$f")
+done
 ```
 
-Файл миграции создаёт все 9 таблиц, индексы, триггер `updated_at`, включает RLS и заливает
+Миграции создают все таблицы (см. §2), индексы, триггер `updated_at`, включают RLS и заливают
 **стартовые справочники** (см. §9).
 
 ---
@@ -367,18 +380,19 @@ insert into app_users (login, password, role, name)
 Замени `<BASE>` на `https://<PROJECT_REF>.supabase.co/functions/v1/api`.
 
 ```bash
-# 1) Каталог (должен вернуть JSON с items/emptyAccounts/variables)
-curl -s "<BASE>"
+# 1) Вход (должен вернуть {"success":true,...,"token":"..."} для сид-пользователя)
+curl -s -X POST "<BASE>" -d '{"action":"login","login":"admin","password":"change-me"}'
 
-# 2) Вход (должен вернуть {"success":true,...} для сид-пользователя)
-curl -s "<BASE>?action=login&login=admin&password=change-me"
+# 2) Каталог с токеном из п.1 (должен вернуть JSON с items/emptyAccounts/variables);
+#    без заголовка — {"code":"unauthorized"} и статус 401
+curl -s "<BASE>" -H "x-app-token: <TOKEN>"
 
 # 3) Неизвестное действие (проверка, что функция задеплоена)
 curl -s -X POST "<BASE>" -H "Content-Type: application/json" -d '{"action":"__ping__"}'
 # ожидаемо: {"error":"Неизвестное действие"}  (а НЕ 404/пусто)
 ```
 
-Если `curl "<BASE>"` вернул `items`/`variables` — БД и функция связаны верно.
+Если каталог с токеном вернул `items`/`variables` — БД и функция связаны верно.
 
 ---
 
@@ -403,18 +417,25 @@ npx vercel --prod
 
 ## 12. Полный справочник Edge Function API
 
-Единый эндпоинт: `{SUPABASE_URL}/functions/v1/api`. CORS открыт (`*`). JWT не требуется.
+Единый эндпоинт: `{SUPABASE_URL}/functions/v1/api`. CORS открыт (`*`). Supabase JWT не требуется,
+но все запросы, кроме входа, требуют токен приложения в заголовке `x-app-token` (см. §3.6):
+без него — `401 {code:"unauthorized"}`, для admin-действий без роли `admin` — `403 {code:"forbidden"}`.
+Поле `actor` (кто сделал действие) функция берёт из токена.
+
+### Вход
+
+- `POST {action:"login", login, password}` → `{ success, role, name, token }` или `{ success:false, message }`.
 
 ### GET
 
-- `?action=login&login=<L>&password=<P>` → `{ success, role, name }` или `{ success:false, message }`.
-- **без `action`** → каталог:
+- **без параметров** → каталог:
   ```jsonc
   {
     "items": [{
       "id","name","title","type","coverUrl","hasPS5","hasPS4",
       "editions": ["Standard", ...],
-      "accountDetails": { "Standard": [ { "email", "slots":[{"isOccupied":bool} ×5] } ] }
+      "accountDetails": { "Standard": [ { "email", "slots":[{"isOccupied":bool} ×5] } ] },
+      "prices": { "Standard|PS5|П3": 2390 }
     }],
     "emptyAccounts": [{ "email","region","isProblem" }],
     "variables": {
@@ -431,12 +452,13 @@ npx vercel --prod
 | `addGame` (алиас `add`) | `type, name, editions[], hasPS5, hasPS4, coverUrl?` | Добавляет карточку. Для `type='игры'` без `coverUrl` пытается подтянуть обложку из PS Store. TG-уведомление |
 | `addEdition` | `gameName, type, edition` | Добавляет издание в массив (макс. 5) |
 | `updateGame` | `id, name, coverUrl, editions[], hasPS5, hasPS4` | Обновляет карточку; при смене `name` переносит `game_name` в `accounts` и `orders` |
+| `updatePrices` | `id, prices{"Издание\|Платформа\|Слот": цена}, actor?` | Сохраняет прайс игры (пустые и нечисловые цены отбрасываются); пишет «Изменены цены» в журнал с возможностью отмены. `{ success, prices }` |
 | `backfillCovers` | — | Дозаполняет пустые обложки для игр из PS Store. Возвращает `{updated, failed[]}` |
 | `addAccount` | `gameName, edition, login, expense, currency, employee, manualDate?` | Создаёт аккаунт (слоты пустые), убирает из `empty_accounts`, TG |
 | `addOrder` | `login, gameName, edition, client, slot, price, paymentMethod, employee, expense?, currency?, manualDate?` | Пишет заказ; занимает/освобождает слот; если логина ещё нет — создаёт аккаунт; чистит пустые; TG |
 | `getSlotHistory` | `login` | `{ success, history:[{client, slot, date, price}] }` |
 | `getActivity` | `search?, type? (all/order/game/account/empty), offset?` | Журнал действий (таблица `activity_log`, без ручных действий со слотами), новые сверху, по 50 шт. `{ success, events:[{id, type, action, title, details, login, gameName, actor, price, createdAt}], hasMore }`. Все изменяющие действия принимают необязательное поле `actor` — кто совершил действие |
-| `getActivityItem` | `id` | Текущие значения редактируемых полей записи журнала: `{ success, fields, linked }`. `linked=false` — исходных данных уже нет, запись можно только убрать |
+| `getActivityItem` | `id` | Текущие значения редактируемых полей и полная информация записи журнала: `{ success, fields, linked, info:[{label, value, kind?}] }`. `linked=false` — исходных данных уже нет, запись можно только убрать |
 | `updateActivity` | `id, fields` | Правит исходные данные записи (заказ, аккаунт, игру, издание, пустой аккаунт) и саму запись журнала |
 | `deleteActivity` | `id` | Отменяет действие (удаляет заказ и возвращает слот, удаляет игру/аккаунт, откатывает изменения) и заменяет запись на «Удалён …» (`action='deleted'`, в `undo.journal` — всё, что изменено). `{ success, warnings[] }` или `{ success:false, error }`. Для записи `deleted` — удаляет её насовсем |
 | `restoreActivity` | `id` записи `deleted` | Возвращает всё, что убрало удаление, вместе с исходной записью журнала |

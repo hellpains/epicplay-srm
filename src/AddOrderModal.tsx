@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect, useMemo } from "react";
-import { currentActor } from "./config";
+import { apiFetch } from "./config";
 import { motion, AnimatePresence } from "framer-motion";
 import { X, Check, ChevronDown } from "lucide-react";
 
@@ -317,7 +317,6 @@ const handleSubmit = (e?: React.FormEvent) => {
     try {
       const requestPayload: any = {
         action: orderType === "Шеринг аккаунт" ? "addAccount" : "addOrder",
-        actor: currentActor(),
         login: login.trim(),
         gameName: selectedGame.name,
         edition: selectedEdition,
@@ -337,9 +336,8 @@ const handleSubmit = (e?: React.FormEvent) => {
         requestPayload.currency = isNewLogin && expenseValue ? currency : "";
       }
 
-      const request = fetch(API_URL, {
+      const request = apiFetch(API_URL, {
         method: "POST",
-        mode: "no-cors",
         keepalive: true, 
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(requestPayload),

@@ -158,6 +158,7 @@ async function buildCatalog() {
       hasPS4: toBool(row.has_ps4),
       editions,
       accountDetails,
+      prices: row.prices ?? {},
     };
   });
 
@@ -187,6 +188,86 @@ async function buildCatalog() {
   return { items, emptyAccounts, variables };
 }
 
+// --- Авторизация -----------------------------------------------------------
+// Токен = base64url(JSON) + "." + HMAC-SHA256(подпись). Подписывается секретом,
+// который есть только у функции, поэтому подделать его из браузера нельзя.
+// В токене — отпечаток пароля: смена пароля сразу делает старые токены недействительными.
+const AUTH_SECRET = Deno.env.get("AUTH_SECRET") || SERVICE_ROLE_KEY;
+const TOKEN_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+const encoder = new TextEncoder();
+
+function toBase64Url(bytes: Uint8Array) {
+  let binary = "";
+  for (const b of bytes) binary += String.fromCharCode(b);
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+function fromBase64Url(text: string) {
+  const binary = atob(text.replace(/-/g, "+").replace(/_/g, "/"));
+  return Uint8Array.from(binary, (c) => c.charCodeAt(0));
+}
+
+let signingKey: CryptoKey | null = null;
+async function sign(data: string) {
+  signingKey ??= await crypto.subtle.importKey(
+    "raw",
+    encoder.encode(AUTH_SECRET),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+  const signature = await crypto.subtle.sign("HMAC", signingKey, encoder.encode(data));
+  return toBase64Url(new Uint8Array(signature));
+}
+
+async function passwordFingerprint(password: string) {
+  const digest = await crypto.subtle.digest("SHA-256", encoder.encode(AUTH_SECRET + password));
+  return toBase64Url(new Uint8Array(digest)).slice(0, 16);
+}
+
+function safeEqual(a: string, b: string) {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return diff === 0;
+}
+
+async function issueToken(user: any) {
+  const payload = {
+    l: user.login,
+    e: Date.now() + TOKEN_TTL_MS,
+    p: await passwordFingerprint(String(user.password)),
+  };
+  const body = toBase64Url(encoder.encode(JSON.stringify(payload)));
+  return `${body}.${await sign(body)}`;
+}
+
+type AuthUser = { login: string; role: string; name: string };
+
+async function verifyToken(token: string | null): Promise<AuthUser | null> {
+  if (!token) return null;
+  const [body, signature] = token.split(".");
+  if (!body || !signature || !safeEqual(signature, await sign(body))) return null;
+
+  let payload: any;
+  try {
+    payload = JSON.parse(new TextDecoder().decode(fromBase64Url(body)));
+  } catch (_e) {
+    return null;
+  }
+  if (!payload?.l || typeof payload.e !== "number" || payload.e < Date.now()) return null;
+
+  // Пользователь мог быть удалён или сменить пароль после выдачи токена
+  const { data: user } = await db
+    .from("app_users")
+    .select("login, password, role, name")
+    .eq("login", payload.l)
+    .maybeSingle();
+  if (!user || payload.p !== (await passwordFingerprint(String(user.password)))) return null;
+
+  return { login: user.login, role: user.role, name: user.name };
+}
+
 async function login(loginValue: string, password: string) {
   const { data } = await db
     .from("app_users")
@@ -195,10 +276,19 @@ async function login(loginValue: string, password: string) {
     .maybeSingle();
 
   if (data && String(data.password) === String(password)) {
-    return { success: true, role: data.role, name: data.name };
+    return { success: true, role: data.role, name: data.name, token: await issueToken(data) };
   }
   return { success: false, message: "Неверный логин или пароль" };
 }
+
+// Журнал изменений — только для администратора
+const ADMIN_ACTIONS = new Set([
+  "getActivity",
+  "getActivityItem",
+  "updateActivity",
+  "deleteActivity",
+  "restoreActivity",
+]);
 
 function slotFieldForBase(base: string) {
   if (base === "PS4 П3") return "slot4";
@@ -414,6 +504,43 @@ async function handleBackfillCovers() {
   }
 
   return json({ success: true, updated, failed });
+}
+
+// Ключ прайса: "Издание|PS5|П3"
+function renamePriceEdition(prices: any, oldEdition: string, newEdition: string) {
+  const result: Record<string, number> = {};
+  for (const [key, value] of Object.entries(prices ?? {})) {
+    const [edition, ...rest] = key.split("|");
+    const newKey = edition === oldEdition ? [newEdition, ...rest].join("|") : key;
+    result[newKey] = value as number;
+  }
+  return result;
+}
+
+async function handleUpdatePrices(data: any) {
+  const g = await fetchRef("catalog_items", data.id);
+  if (!g) return json({ success: false, error: "Игра не найдена" });
+
+  const prices: Record<string, number> = {};
+  for (const [key, value] of Object.entries(data.prices ?? {})) {
+    const price = parsePrice(value);
+    if (price !== null && price > 0) prices[key] = price;
+  }
+
+  const { error } = await db
+    .from("catalog_items")
+    .update({ prices })
+    .eq("id", g.id);
+  if (error) return json({ success: false, error: error.message });
+
+  await logActivity("game", "prices_update", "Изменены цены", {
+    details: g.name,
+    gameName: g.name,
+    actor: data.actor,
+    refId: g.id,
+    undo: { before: g.prices ?? {} },
+  });
+  return json({ success: true, prices });
 }
 
 async function handleAddEdition(data: any) {
@@ -766,6 +893,7 @@ async function activityFields(ev: any): Promise<Record<string, unknown> | null> 
         price: o.price,
         paymentMethod: o.payment_method ?? "",
         employee: o.employee ?? "",
+        date: o.created_at,
       };
     }
     case "account_add": {
@@ -789,6 +917,7 @@ async function activityFields(ev: any): Promise<Record<string, unknown> | null> 
       return { edition };
     }
     case "game_update":
+    case "prices_update":
       return ev.undo?.before && (await fetchRef("catalog_items", ev.ref_id))
         ? {}
         : null;
@@ -807,11 +936,83 @@ async function activityFields(ev: any): Promise<Record<string, unknown> | null> 
   }
 }
 
+type InfoRow = { label: string; value: unknown; kind?: "date" | "price" | "mono" };
+
+// Полная информация о записи для экрана просмотра: строки «название — значение»
+async function activityInfo(ev: any): Promise<InfoRow[]> {
+  const rows: InfoRow[] = [];
+  const add = (label: string, value: unknown, kind?: InfoRow["kind"]) => {
+    if (value !== null && value !== undefined && value !== "") rows.push({ label, value, kind });
+  };
+
+  switch (ev.action) {
+    case "order_add":
+    case "order_return": {
+      const o = await fetchRef("orders", ev.ref_id);
+      if (!o) break;
+      add("Дата", o.created_at, "date");
+      add("Сотрудник", o.employee);
+      add("Клиент", o.client);
+      add("Игра", gameLabel(o.game_name, o.edition));
+      add("Слот", o.slot);
+      add("Логин", o.login, "mono");
+      add("Цена", o.price, "price");
+      add("Способ оплаты", o.payment_method);
+      return rows;
+    }
+    case "account_add":
+    case "account_expense": {
+      const id = ev.action === "account_add" ? ev.ref_id : ev.undo?.prev?.[0]?.id;
+      const a = await fetchRef("accounts", id);
+      if (!a) break;
+      add("Дата", ev.action === "account_add" ? a.purchase_date ?? a.created_at : ev.created_at, "date");
+      add("Игра", gameLabel(a.game_name, a.edition));
+      add("Логин", a.login, "mono");
+      add("Расход", Number(a.expense_total ?? 0), "price");
+      return rows;
+    }
+    case "game_add":
+    case "edition_add":
+    case "game_update":
+    case "prices_update": {
+      const g = await fetchRef("catalog_items", ev.ref_id);
+      if (!g) break;
+      add("Дата", ev.created_at, "date");
+      add(g.type === "подписки" ? "Подписка" : "Игра", g.name);
+      if (ev.action === "edition_add") add("Издание", ev.undo?.edition);
+      if (ev.action === "game_update") add("Изменения", String(ev.details).split(" · ").slice(1).join(" · "));
+      add("Издания", (g.editions ?? []).join(", "));
+      add("Платформы", [g.has_ps5 && "PS5", g.has_ps4 && "PS4"].filter(Boolean).join(", "));
+      return rows;
+    }
+    case "empty_add":
+    case "empty_update":
+    case "empty_trash":
+    case "empty_restore": {
+      const e = await fetchRef("empty_accounts", ev.ref_id);
+      if (!e) break;
+      add("Дата", ev.created_at, "date");
+      add("Почта", e.email, "mono");
+      add("Регион", e.region);
+      add("Статус", e.is_problem ? "В корзине" : e.status);
+      return rows;
+    }
+  }
+
+  // Удалённые записи и записи без исходных данных — то, что сохранилось в журнале
+  add(ev.action === "deleted" ? "Удалено" : "Дата", ev.created_at, "date");
+  add("Описание", ev.details);
+  add(ev.type === "empty" ? "Почта" : "Логин", ev.login, "mono");
+  add("Цена", ev.price, "price");
+  return rows;
+}
+
 async function handleGetActivityItem(data: any) {
   const ev = await loadActivity(data.id);
   if (!ev) return json({ success: false, error: "Запись не найдена" });
   const fields = await activityFields(ev);
-  return json({ success: true, fields: fields ?? {}, linked: fields !== null });
+  const info = await activityInfo(ev);
+  return json({ success: true, fields: fields ?? {}, linked: fields !== null, info });
 }
 
 async function handleUpdateActivity(data: any) {
@@ -828,11 +1029,14 @@ async function handleUpdateActivity(data: any) {
       const o = await fetchRef("orders", ev.ref_id);
       let price = f.price !== undefined ? parsePrice(f.price) : o.price;
       if (ev.action === "order_return" && price !== null && price > 0) price = -price;
+      const date = f.date ? new Date(f.date) : null;
+      const createdAt = date && !isNaN(date.getTime()) ? date.toISOString() : o.created_at;
       const patch = {
         client: f.client !== undefined ? str(f.client) : o.client,
         price,
         payment_method: f.paymentMethod !== undefined ? str(f.paymentMethod) : o.payment_method,
         employee: f.employee !== undefined ? str(f.employee) : o.employee,
+        created_at: createdAt,
       };
       const { error } = await db.from("orders").update(patch).eq("id", o.id);
       if (error) return json({ success: false, error: error.message });
@@ -842,6 +1046,7 @@ async function handleUpdateActivity(data: any) {
           details: orderDetails(o.game_name, o.edition, o.slot, patch.client),
           price: patch.price,
           actor: patch.employee || ev.actor,
+          created_at: createdAt,
         })
         .eq("id", ev.id);
       break;
@@ -934,7 +1139,7 @@ async function handleUpdateActivity(data: any) {
         );
         const { error } = await db
           .from("catalog_items")
-          .update({ editions })
+          .update({ editions, prices: renamePriceEdition(g.prices, oldEdition, newEdition) })
           .eq("id", g.id);
         if (error) return json({ success: false, error: error.message });
         await db
@@ -1207,6 +1412,11 @@ async function undoActivity(
       }
       return null;
     }
+    case "prices_update": {
+      const g = await fetchRef("catalog_items", ev.ref_id);
+      await updateRow(journal, "catalog_items", g, { prices: ev.undo.before });
+      return null;
+    }
     case "empty_add": {
       const e = await fetchRef("empty_accounts", ev.ref_id);
       await deleteRows(journal, "empty_accounts", [e]);
@@ -1237,6 +1447,7 @@ const DELETED_TITLES: Record<string, string> = {
   account_expense: "Отменено изменение расхода",
   edition_add: "Удалено издание",
   game_update: "Отменено изменение игры",
+  prices_update: "Отменено изменение цен",
   empty_add: "Удалён пустой аккаунт",
   empty_update: "Отменено обновление пустого аккаунта",
   empty_trash: "Отменён перенос в корзину",
@@ -1607,35 +1818,43 @@ Deno.serve(async (req) => {
   }
 
   try {
-    const url = new URL(req.url);
-
-    if (req.method === "GET") {
-      const action = url.searchParams.get("action");
-      if (action === "login") {
-        const result = await login(
-          url.searchParams.get("login") ?? "",
-          url.searchParams.get("password") ?? "",
-        );
-        return json(result);
-      }
-      const catalog = await buildCatalog();
-      return json(catalog);
-    }
-
+    let data: any = {};
     if (req.method === "POST") {
-      let data: any = {};
       try {
         data = await req.json();
       } catch (_e) {
         data = {};
       }
+      if (data.action === "login") {
+        return json(await login(str(data.login), String(data.password ?? "")));
+      }
+    }
 
+    // Всё, кроме входа, — только с действующим токеном
+    const user = await verifyToken(req.headers.get("x-app-token"));
+    if (!user) {
+      return json({ success: false, error: "Нужно войти заново", code: "unauthorized" }, 401);
+    }
+    if (ADMIN_ACTIONS.has(data.action) && user.role !== "admin") {
+      return json({ success: false, error: "Недостаточно прав", code: "forbidden" }, 403);
+    }
+    // Кто сделал действие — берём из токена, а не из того, что прислал браузер
+    data.actor = user.name || user.login;
+
+    if (req.method === "GET") {
+      const catalog = await buildCatalog();
+      return json(catalog);
+    }
+
+    if (req.method === "POST") {
       switch (data.action) {
         case "addGame":
         case "add":
           return await handleAddGame(data);
         case "addEdition":
           return await handleAddEdition(data);
+        case "updatePrices":
+          return await handleUpdatePrices(data);
         case "updateGame":
           return await handleUpdateGame(data);
         case "backfillCovers":

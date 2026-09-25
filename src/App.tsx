@@ -5,7 +5,7 @@ import CatalogScreen from "./CatalogScreen";
 import EmptyAccountsScreen from "./EmptyAccountsScreen";
 import AddOrderModal from "./AddOrderModal";
 import ActivityScreen from "./ActivityScreen";
-import {API_URL} from "./config";
+import {API_URL, AUTH_EXPIRED_EVENT, SESSION_KEY, apiFetch} from "./config";
 
 function AuthWall({onLoginSuccess}: { onLoginSuccess: (user: any) => void }) {
     const [login, setLogin] = useState("");
@@ -19,16 +19,15 @@ function AuthWall({onLoginSuccess}: { onLoginSuccess: (user: any) => void }) {
         setError("");
 
         try {
-            const response = await fetch(
-                `${API_URL}?action=login&login=${encodeURIComponent(
-                    login
-                )}&password=${encodeURIComponent(password)}`
-            );
+            const response = await fetch(API_URL, {
+                method: "POST",
+                body: JSON.stringify({action: "login", login, password}),
+            });
             const data = await response.json();
 
             if (data.success) {
-                const userData = {login, role: data.role, name: data.name};
-                localStorage.setItem("app_auth_session", JSON.stringify(userData));
+                const userData = {login, role: data.role, name: data.name, token: data.token};
+                localStorage.setItem(SESSION_KEY, JSON.stringify(userData));
                 onLoginSuccess(userData);
             } else {
                 setError(data.message || "Неверный логин или пароль");
@@ -109,10 +108,25 @@ const TemplatesScreen = () => (
 );
 
 export default function App() {
+    // Сессия без токена (вход до появления авторизации на сервере) — просим войти заново
     const [authUser, setAuthUser] = useState<any>(() => {
-        const saved = localStorage.getItem("app_auth_session");
-        return saved ? JSON.parse(saved) : null;
+        try {
+            const saved = JSON.parse(localStorage.getItem(SESSION_KEY) ?? "null");
+            return saved?.token ? saved : null;
+        } catch {
+            return null;
+        }
     });
+
+    const logout = () => {
+        localStorage.removeItem(SESSION_KEY);
+        setAuthUser(null);
+    };
+
+    useEffect(() => {
+        window.addEventListener(AUTH_EXPIRED_EVENT, logout);
+        return () => window.removeEventListener(AUTH_EXPIRED_EVENT, logout);
+    }, []);
 
     const [currentScreen, setCurrentScreen] = useState<string>("catalog");
     const [items, setItems] = useState<any[]>([]);
@@ -134,7 +148,7 @@ export default function App() {
         if (!silent) setIsLoading(true);
 
         try {
-            const response = await fetch(API_URL);
+            const response = await apiFetch(API_URL);
             const data = await response.json();
 
             if (data.items) {
@@ -209,10 +223,7 @@ export default function App() {
                 Вы вошли как: <span className="text-white">{authUser.name} ({authUser.role})</span>
             </div>
             <button
-                onClick={() => {
-                    localStorage.removeItem("app_auth_session");
-                    setAuthUser(null);
-                }}
+                onClick={logout}
                 className="px-6 py-2 bg-red-500/10 text-red-500 rounded-full border border-red-500/20 active:scale-95 transition-all"
             >
                 Выйти из аккаунта

@@ -1,5 +1,5 @@
 import { useState, useEffect, useMemo, useRef } from "react";
-import { motion, AnimatePresence } from "framer-motion";
+import { AnimatePresence } from "framer-motion";
 import {
   Search,
   Loader2,
@@ -11,9 +11,9 @@ import {
   UserPlus,
   Inbox,
   Trash2,
-  RotateCcw,
 } from "lucide-react";
-import { currentActor } from "./config";
+import ActivityDetails from "./components/ActivityDetails";
+import { apiFetch } from "./config";
 
 type ActivityEvent = {
   id: string;
@@ -93,6 +93,7 @@ const UNDO_HINT: Record<string, string> = {
   game_add: "Игра удалится из каталога. Если есть аккаунты — сначала удалите их.",
   edition_add: "Издание удалится. Если есть аккаунты — сначала удалите их.",
   game_update: "Игра вернётся к виду до изменения.",
+  prices_update: "Вернутся прежние цены.",
   empty_add: "Пустой аккаунт удалится.",
   empty_update: "У пустого аккаунта вернутся прежние данные.",
   empty_trash: "Аккаунт вернётся из корзины.",
@@ -131,7 +132,7 @@ export default function ActivityScreen({ API_URL, footer, variables, fetchItems 
     setIsLoading(true);
     setError("");
     try {
-      const response = await fetch(API_URL, {
+      const response = await apiFetch(API_URL, {
         method: "POST",
         body: JSON.stringify({
           action: "getActivity",
@@ -280,8 +281,10 @@ export default function ActivityScreen({ API_URL, footer, variables, fetchItems 
 
       <AnimatePresence>
         {editing && (
-          <EditSheet
+          <ActivityDetails
             event={editing}
+            style={eventStyle(editing)}
+            undoHint={UNDO_HINT[editing.action]}
             API_URL={API_URL}
             variables={variables}
             onClose={() => setEditing(null)}
@@ -298,11 +301,11 @@ export default function ActivityScreen({ API_URL, footer, variables, fetchItems 
   );
 }
 
+const eventStyle = (event: ActivityEvent) =>
+  event.action === "deleted" ? DELETED_STYLE : TYPE_STYLE[event.type] ?? TYPE_STYLE.empty;
+
 function EventCard({ event, onClick }: { event: ActivityEvent; onClick: () => void }) {
-  const style =
-    event.action === "deleted"
-      ? DELETED_STYLE
-      : TYPE_STYLE[event.type] ?? TYPE_STYLE.empty;
+  const style = eventStyle(event);
   const Icon = style.icon;
   const time = new Date(activityTime(event)).toLocaleTimeString("ru-RU", {
     hour: "2-digit",
@@ -356,264 +359,4 @@ function EventCard({ event, onClick }: { event: ActivityEvent; onClick: () => vo
     </div>
   );
 }
-
-function Field({ label, children }: any) {
-  return (
-    <label className="block mb-3">
-      <span className="block text-[11px] font-bold uppercase tracking-widest text-neutral-500 mb-1.5">
-        {label}
-      </span>
-      {children}
-    </label>
-  );
-}
-
-const inputClass =
-  "w-full bg-[#1c1c1e] border border-white/10 rounded-xl px-4 py-3 text-[16px] text-white outline-none focus:border-[#12c83b]/50 transition-colors";
-
-function ChipSelect({ options, value, onChange }: any) {
-  const list: string[] = options.includes(value) || !value ? options : [value, ...options];
-  return (
-    <div className="flex flex-wrap gap-2">
-      {list.map((o) => (
-        <button
-          key={o}
-          type="button"
-          onClick={() => onChange(o)}
-          className={`px-3 py-1.5 rounded-[10px] text-[12px] font-semibold border transition-all ${
-            value === o
-              ? "bg-white text-black border-white"
-              : "bg-white/5 text-white/80 border-white/10"
-          }`}
-        >
-          {o}
-        </button>
-      ))}
-    </div>
-  );
-}
-
-// Поля записи, которые можно менять, и подписи к ним
-const TEXT_FIELDS: { key: string; label: string; numeric?: boolean }[] = [
-  { key: "client", label: "Клиент" },
-  { key: "price", label: "Цена, ₽", numeric: true },
-  { key: "login", label: "Логин" },
-  { key: "expense", label: "Расход, ₽", numeric: true },
-  { key: "name", label: "Название" },
-  { key: "edition", label: "Издание" },
-  { key: "email", label: "Почта" },
-];
-
-function EditSheet({ event, API_URL, variables, onClose, onDone }: any) {
-  const [fields, setFields] = useState<Record<string, any> | null>(null);
-  const [linked, setLinked] = useState(true);
-  const [isBusy, setIsBusy] = useState(false);
-  const [confirmDelete, setConfirmDelete] = useState(false);
-  const [error, setError] = useState("");
-
-  const post = async (body: any) => {
-    const response = await fetch(API_URL, { method: "POST", body: JSON.stringify(body) });
-    return response.json();
-  };
-
-  useEffect(() => {
-    post({ action: "getActivityItem", id: event.id })
-      .then((result) => {
-        if (result.success) {
-          setFields(result.fields);
-          setLinked(result.linked);
-        } else {
-          setError(result.error || "Не удалось загрузить запись");
-          setFields({});
-        }
-      })
-      .catch(() => {
-        setError("Ошибка сети");
-        setFields({});
-      });
-  }, [event.id]);
-
-  const set = (key: string) => (value: any) =>
-    setFields((prev) => ({ ...(prev ?? {}), [key]: value }));
-
-  const run = async (body: any, success: (result: any) => string) => {
-    setIsBusy(true);
-    setError("");
-    try {
-      const result = await post(body);
-      if (result.success) onDone(success(result));
-      else setError(result.error || "Ошибка");
-    } catch (e) {
-      setError("Ошибка сети");
-    } finally {
-      setIsBusy(false);
-    }
-  };
-
-  const handleSave = () => run({ action: "updateActivity", id: event.id, fields }, () => "");
-
-  const handleDelete = () => {
-    if (!confirmDelete) {
-      setConfirmDelete(true);
-      return;
-    }
-    run({ action: "deleteActivity", id: event.id, actor: currentActor() }, (result) =>
-      (result.warnings ?? []).join(". ")
-    );
-  };
-
-  const handleRestore = () => run({ action: "restoreActivity", id: event.id }, () => "");
-
-  const isDeleted = event.action === "deleted";
-  const hasFields = linked && fields !== null && Object.keys(fields).length > 0;
-  const regions: string[] = (variables?.regions ?? []).map((r: any) => r.code);
-
-  return (
-    <div
-      className="fixed inset-0 z-[300] flex items-end justify-center bg-black/60 backdrop-blur-md"
-      onClick={onClose}
-    >
-      <motion.div
-        initial={{ y: "100%" }}
-        animate={{ y: 0 }}
-        exit={{ y: "100%" }}
-        transition={{ type: "spring", damping: 30, stiffness: 320 }}
-        onClick={(e) => e.stopPropagation()}
-        className="relative w-full max-w-md bg-[#1a1a1c] border-t border-white/10 rounded-t-[30px] p-6 pb-10 max-h-[90dvh] overflow-y-auto"
-      >
-        <button
-          onClick={onClose}
-          className="absolute top-4 right-4 w-8 h-8 flex items-center justify-center rounded-full bg-white/5 text-neutral-400 active:scale-90 transition-all"
-        >
-          <X size={18} />
-        </button>
-
-        <h3 className="text-lg font-bold text-white pr-10">{event.title}</h3>
-        {event.details && <div className="text-[13px] text-neutral-400 mt-1 pr-6">{event.details}</div>}
-        {event.login && <div className="text-[12px] text-neutral-500 mt-1">{event.login}</div>}
-        <div className="text-[12px] text-neutral-500 mt-1">
-          {fullDate(event.createdAt)}
-          {event.restoredAt && ` · восстановлено ${fullDate(event.restoredAt)}`}
-          {event.editedAt && ` · изменено ${fullDate(event.editedAt)}`}
-        </div>
-
-        <div className="mt-5">
-          {fields === null ? (
-            <div className="flex justify-center py-6">
-              <Loader2 size={22} className="animate-spin text-green-500" />
-            </div>
-          ) : isDeleted ? (
-            <div className="text-[13px] text-neutral-400 bg-white/5 rounded-2xl p-3.5">
-              Всё, что убрало это удаление, можно вернуть: исходная запись и данные в приложении
-              восстановятся.
-            </div>
-          ) : !linked ? (
-            <div className="text-[13px] text-neutral-400 bg-white/5 rounded-2xl p-3.5">
-              Исходные данные этой записи уже удалены или её нельзя отменить. Можно только убрать
-              запись из истории.
-            </div>
-          ) : (
-            <>
-              {TEXT_FIELDS.filter((f) => f.key in fields).map((f) => (
-                <Field key={f.key} label={f.label}>
-                  <input
-                    className={inputClass}
-                    inputMode={f.numeric ? "decimal" : undefined}
-                    value={fields[f.key] ?? ""}
-                    onChange={(e) => set(f.key)(e.target.value)}
-                  />
-                </Field>
-              ))}
-              {"paymentMethod" in fields && (
-                <Field label="Способ оплаты">
-                  <ChipSelect
-                    options={variables?.paymentMethods ?? []}
-                    value={fields.paymentMethod}
-                    onChange={set("paymentMethod")}
-                  />
-                </Field>
-              )}
-              {"employee" in fields && (
-                <Field label="Сотрудник">
-                  <ChipSelect
-                    options={variables?.employees ?? []}
-                    value={fields.employee}
-                    onChange={set("employee")}
-                  />
-                </Field>
-              )}
-              {"region" in fields && (
-                <Field label="Регион">
-                  <ChipSelect options={regions} value={fields.region} onChange={set("region")} />
-                </Field>
-              )}
-              {!hasFields && (
-                <div className="text-[13px] text-neutral-400 bg-white/5 rounded-2xl p-3.5">
-                  В этой записи нечего менять — её можно только отменить.
-                </div>
-              )}
-            </>
-          )}
-        </div>
-
-        {error && <div className="text-red-500 text-sm mt-3">{error}</div>}
-
-        {fields !== null && (
-          <div className="mt-5 space-y-2.5">
-            {hasFields && (
-              <button
-                onClick={handleSave}
-                disabled={isBusy}
-                className="w-full py-3.5 bg-[#12c83b] text-black font-bold rounded-2xl active:scale-95 transition-all disabled:opacity-50"
-              >
-                {isBusy && !confirmDelete ? "Сохранение..." : "Сохранить"}
-              </button>
-            )}
-
-            {isDeleted && (
-              <button
-                onClick={handleRestore}
-                disabled={isBusy}
-                className="w-full py-3.5 bg-[#12c83b] text-black font-bold rounded-2xl active:scale-95 transition-all disabled:opacity-50 flex items-center justify-center gap-2"
-              >
-                <RotateCcw size={16} />
-                {isBusy && !confirmDelete ? "Восстановление..." : "Восстановить"}
-              </button>
-            )}
-
-            {confirmDelete && (
-              <div className="text-[13px] text-red-300/90 px-1">
-                {isDeleted
-                  ? "Запись об удалении пропадёт, восстановить данные будет уже нельзя."
-                  : linked
-                  ? (UNDO_HINT[event.action] ?? "Запись удалится из истории.") +
-                    " Удаление появится в истории, его можно будет восстановить."
-                  : "Запись удалится из истории, данные в приложении не изменятся."}
-              </div>
-            )}
-            <button
-              onClick={handleDelete}
-              disabled={isBusy}
-              className={`w-full py-3.5 rounded-2xl font-semibold flex items-center justify-center gap-2 border active:scale-95 transition-all disabled:opacity-50 ${
-                confirmDelete
-                  ? "bg-red-500 text-white border-red-400"
-                  : "bg-red-500/10 text-red-400 border-red-500/20"
-              }`}
-            >
-              <Trash2 size={16} />
-              {confirmDelete
-                ? isBusy
-                  ? "Удаление..."
-                  : "Точно удалить"
-                : isDeleted
-                ? "Убрать из истории навсегда"
-                : linked
-                ? "Удалить и отменить действие"
-                : "Убрать из истории"}
-            </button>
-          </div>
-        )}
-      </motion.div>
-    </div>
-  );
-}
+
