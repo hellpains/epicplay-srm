@@ -1,0 +1,8 @@
+{
+  "functions": {
+    "api/sbp-qr.js": {
+      "maxDuration": 60,
+      "includeFiles": "node_modules/@sparticuz/chromium/bin/**"
+    }
+  }
+}

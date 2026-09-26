@@ -21,11 +21,13 @@ import {
   Settings,
   Trash2,
   Hand,
+  QrCode,
 } from "lucide-react";
 import AddGameModal from "./components/AddGameModal";
 import PriceTable from "./components/PriceTable";
 import StandardPrices from "./components/StandardPrices";
 import { MyLogo } from "./components/MyLogo";
+import { PaymentQrModal } from "./components/PaymentQrModal";
 
 function ResultDialog({
   type,
@@ -101,6 +103,7 @@ export default function CatalogScreen({
   const [catalogMode, setCatalogMode] = useState<"шеринг" | "стандарт">("шеринг");
   const [categoryTab, setCategoryTab] = useState("игры");
   const [isSearchActive, setIsSearchActive] = useState(false);
+  const [isQrOpen, setIsQrOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
   const [sortBy, setSortBy] = useState("popularity");
 
@@ -691,21 +694,31 @@ export default function CatalogScreen({
                 <div className="flex items-center gap-2 ml-2">
                   <MyLogo className="h-[20px] w-auto text-neutral-400 shrink-0 drop-shadow-sm" />
                 </div>
-                <motion.button
-                  onTap={() => fetchItems(false)}
-                  whileTap={{ scale: 0.85 }}
-                  style={{ WebkitTapHighlightColor: "transparent" }}
-                  className="cursor-pointer touch-manipulation select-none h-10 w-10 flex items-center justify-center transition-all mr-12"
-                >
-                  <RotateCw
-                    size={18}
-                    className={
-                      isSyncing
-                        ? "animate-spin text-green-500"
-                        : "text-neutral-400"
-                    }
-                  />
-                </motion.button>
+                <div className="flex items-center gap-2 mr-12">
+                  <motion.button
+                    onTap={() => setIsQrOpen(true)}
+                    whileTap={{ scale: 0.85 }}
+                    style={{ WebkitTapHighlightColor: "transparent" }}
+                    className="cursor-pointer touch-manipulation select-none h-10 w-10 flex items-center justify-center transition-all"
+                  >
+                    <QrCode size={18} className="text-neutral-400" />
+                  </motion.button>
+                  <motion.button
+                    onTap={() => fetchItems(false)}
+                    whileTap={{ scale: 0.85 }}
+                    style={{ WebkitTapHighlightColor: "transparent" }}
+                    className="cursor-pointer touch-manipulation select-none h-10 w-10 flex items-center justify-center transition-all"
+                  >
+                    <RotateCw
+                      size={18}
+                      className={
+                        isSyncing
+                          ? "animate-spin text-green-500"
+                          : "text-neutral-400"
+                      }
+                    />
+                  </motion.button>
+                </div>
               </motion.div>
             )}
           </AnimatePresence>
@@ -1912,6 +1925,10 @@ export default function CatalogScreen({
           kind={categoryTab === "подписки" ? "подписки" : "игры"}
         />
       )}
+
+      <AnimatePresence>
+        {isQrOpen && <PaymentQrModal onClose={() => setIsQrOpen(false)} />}
+      </AnimatePresence>
     </>
   );
 }

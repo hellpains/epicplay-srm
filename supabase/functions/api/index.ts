@@ -1,9 +1,16 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { crypto as stdCrypto } from "https://deno.land/std@0.224.0/crypto/mod.ts";
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL") ?? "";
 const SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "";
 const TG_TOKEN = Deno.env.get("TG_TOKEN") ?? "";
 const TG_CHAT_ID = Deno.env.get("TG_CHAT_ID") ?? "";
+const CARDLINK_TOKEN = Deno.env.get("CARDLINK_TOKEN") ?? "";
+// Многоразовая ссылка Cardlink и робот на Vercel, который вводит в неё сумму
+// и возвращает прямую ссылку СБП (qr.nspk.ru)
+const CARDLINK_TRANSFER_URL = Deno.env.get("CARDLINK_TRANSFER_URL") ?? "";
+const SBP_ROBOT_URL = Deno.env.get("SBP_ROBOT_URL") ?? "";
+const SBP_ROBOT_KEY = Deno.env.get("SBP_ROBOT_KEY") ?? "";
 
 const db = createClient(SUPABASE_URL, SERVICE_ROLE_KEY, {
   auth: { persistSession: false },
@@ -1865,12 +1872,200 @@ async function handleMarkProblem(data: any, value: boolean) {
   return json({ success: true });
 }
 
+// ---------- Оплата через Cardlink ----------
+
+// Статусы, после которых платёж уже не меняется
+const PAYMENT_FINAL = new Set(["SUCCESS", "OVERPAID", "FAIL"]);
+// Старые неоплаченные платежи больше не опрашиваем
+const PAYMENT_POLL_MS = 3 * 24 * 60 * 60 * 1000;
+
+// Статус платежа Cardlink по открытому адресу, которым пользуется сама страница оплаты.
+// В отличие от API, он не требует IP из вайтлиста. Ответ: {"status":"NEW"}
+async function fetchPaymentStatus(paymentId: string) {
+  const response = await fetch(`https://cardlink.link/check_status/${encodeURIComponent(paymentId)}`, {
+    headers: { Accept: "application/json", "X-Requested-With": "XMLHttpRequest" },
+  });
+  const body = await response.json().catch(() => ({}));
+  const status = str(body.status).toUpperCase();
+  if (!response.ok || !status) throw new Error(`Cardlink ответил ${response.status}`);
+  return status;
+}
+
+async function refreshPaymentStatus(row: any) {
+  const status = await fetchPaymentStatus(row.bill_id);
+  if (status === row.status) return;
+  row.status = status;
+  row.updated_at = new Date().toISOString();
+  await db.from("payments").update({ status, updated_at: row.updated_at }).eq("id", row.id);
+}
+
+// Платежи по QR СБП создаёт робот — у них ссылка qr.nspk.ru и номер платежа Cardlink в bill_id
+function isSbpPayment(row: any) {
+  return String(row.link_url ?? "").startsWith("https://qr.nspk.ru/");
+}
+
+async function handleCreatePayment(data: any) {
+  if (!CARDLINK_TRANSFER_URL || !SBP_ROBOT_URL || !SBP_ROBOT_KEY) {
+    return json({ success: false, error: "Оплата по СБП не настроена на сервере" }, 500);
+  }
+  const clientName = str(data.clientName);
+  const amount = Math.round(Number(String(data.amount ?? "").replace(",", ".")) * 100) / 100;
+  if (!clientName) return json({ success: false, error: "Укажите имя клиента" }, 400);
+  if (!(amount > 0)) return json({ success: false, error: "Укажите сумму" }, 400);
+
+  let robot: any;
+  try {
+    const response = await fetch(SBP_ROBOT_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-robot-key": SBP_ROBOT_KEY },
+      body: JSON.stringify({ transferUrl: CARDLINK_TRANSFER_URL, amount: amount.toFixed(2) }),
+    });
+    robot = await response.json().catch(() => ({}));
+    if (!response.ok || !robot.success) throw new Error(robot.error || `робот ответил ${response.status}`);
+  } catch (e) {
+    return json({ success: false, error: `Не удалось получить QR: ${(e as Error).message}` }, 502);
+  }
+
+  // Номер платежа Cardlink — последняя часть адреса страницы «Оплата по реквизитам»
+  const paymentId = new URL(robot.pageUrl).pathname.split("/").filter(Boolean).pop() ?? "";
+  const { data: row, error } = await db
+    .from("payments")
+    .insert({
+      bill_id: paymentId,
+      client_name: clientName,
+      amount,
+      link_url: robot.sbpUrl,
+      created_by: data.actor,
+    })
+    .select()
+    .single();
+  if (error) throw error;
+  return json({ success: true, payment: row });
+}
+
+// История за выбранный день (from/to — границы дня по времени телефона, ISO).
+// Статусы неоплаченных уточняем у Cardlink.
+async function handleGetPayments(data: any) {
+  const from = new Date(str(data.from));
+  const to = new Date(str(data.to));
+  if (isNaN(from.getTime()) || isNaN(to.getTime())) {
+    return json({ success: false, error: "Не указан день" }, 400);
+  }
+
+  const { data: rows, error } = await db
+    .from("payments")
+    .select("*")
+    .gte("created_at", from.toISOString())
+    .lt("created_at", to.toISOString())
+    .order("created_at", { ascending: false })
+    .limit(200);
+  if (error) throw error;
+
+  const now = Date.now();
+  const pending = (rows ?? []).filter(
+    (p) => isSbpPayment(p) && !PAYMENT_FINAL.has(p.status) && now - new Date(p.created_at).getTime() < PAYMENT_POLL_MS,
+  );
+  await Promise.all(
+    pending.map((p) =>
+      refreshPaymentStatus(p).catch(() => {
+        // Не получилось узнать статус — покажем последний известный
+      }),
+    ),
+  );
+
+  return json({ success: true, payments: rows ?? [] });
+}
+
+async function md5Hex(text: string) {
+  const digest = await stdCrypto.subtle.digest("MD5", new TextEncoder().encode(text));
+  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+// Уведомление Cardlink об оплате (Result URL). Приходит без токена входа,
+// поэтому проверяем подпись: UPPER(md5(OutSum:InvId:apiToken))
+async function handleCardlinkPostback(req: Request) {
+  const raw = await req.text();
+  let fields: Record<string, string>;
+  try {
+    fields = JSON.parse(raw);
+  } catch (_e) {
+    fields = Object.fromEntries(new URLSearchParams(raw));
+  }
+
+  const expected = await md5Hex(`${str(fields.OutSum)}:${str(fields.InvId)}:${CARDLINK_TOKEN}`);
+  const signatureOk = Boolean(CARDLINK_TOKEN) && str(fields.SignatureValue).toUpperCase() === expected.toUpperCase();
+  // Журнал уведомлений как есть — без подписи
+  const { SignatureValue: _signature, ...logged } = fields;
+  const { data: log, error } = await db
+    .from("cardlink_postbacks")
+    .insert({ fields: logged, signature_ok: signatureOk })
+    .select("id")
+    .single();
+  if (error) throw error;
+  if (!signatureOk) return new Response("bad signature", { status: 403 });
+
+  if (str(fields.Status)) await applyPostback(log.id, fields);
+  return new Response("OK");
+}
+
+// Сколько после создания QR его оплату (или отказ — неоплаченный QR Cardlink отклоняет не сразу)
+// ещё можно связать с уведомлением
+const POSTBACK_MATCH_MS = 24 * 60 * 60 * 1000;
+
+// Уведомление → строка истории. Номера платежа в уведомлении нет (TrsId — номер многоразовой
+// ссылки, общий для всех платежей), поэтому QR из приложения ищем по сумме среди недавних
+// и сверяем его статус у Cardlink. Не нашли — платёж прошёл мимо приложения, добавляем его.
+async function applyPostback(postbackId: number, fields: Record<string, string>) {
+  const status = str(fields.Status).toUpperCase();
+  const amount = Number(fields.OutSum) || 0;
+  const details = {
+    status,
+    bank: str(fields.AccountBank) || null,
+    payer_account: str(fields.AccountNumber) || null,
+    postback_id: postbackId,
+    updated_at: new Date().toISOString(),
+  };
+
+  const { data: candidates, error } = await db
+    .from("payments")
+    .select("id, bill_id")
+    .is("postback_id", null)
+    .like("link_url", "https://qr.nspk.ru/%")
+    .eq("amount", amount)
+    .gte("created_at", new Date(Date.now() - POSTBACK_MATCH_MS).toISOString())
+    .order("created_at", { ascending: false });
+  if (error) throw error;
+
+  for (const row of candidates ?? []) {
+    const cardlinkStatus = await fetchPaymentStatus(row.bill_id).catch(() => "");
+    if (cardlinkStatus === status) {
+      const { error: updateError } = await db.from("payments").update(details).eq("id", row.id);
+      if (updateError) throw updateError;
+      return;
+    }
+  }
+
+  const { error: insertError } = await db.from("payments").insert({
+    ...details,
+    bill_id: `postback-${postbackId}`,
+    client_name: "",
+    amount,
+    link_url: "",
+    created_by: "Cardlink",
+  });
+  if (insertError) throw insertError;
+}
+
 Deno.serve(async (req) => {
   if (req.method === "OPTIONS") {
     return new Response("ok", { headers: CORS });
   }
 
   try {
+    if (new URL(req.url).searchParams.get("cardlink") === "postback") {
+      return await handleCardlinkPostback(req);
+    }
+
     let data: any = {};
     if (req.method === "POST") {
       try {
@@ -1942,6 +2137,10 @@ Deno.serve(async (req) => {
           return await handleMarkProblem(data, true);
         case "unmarkProblem":
           return await handleMarkProblem(data, false);
+        case "createPayment":
+          return await handleCreatePayment(data);
+        case "getPayments":
+          return await handleGetPayments(data);
         default:
           return json({ error: "Неизвестное действие" }, 400);
       }
