@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { motion } from "framer-motion";
 import { QRCodeSVG } from "qrcode.react";
-import { X, QrCode, Loader2, Download, Check, Plus, RotateCw } from "lucide-react";
+import { X, QrCode, Loader2, Download, Check, Plus, RotateCw, Wallet, ChevronDown } from "lucide-react";
 import { API_URL, apiFetch } from "../config";
 
 // Платёж, созданный через приложение (строка нашей базы)
@@ -15,7 +15,51 @@ type Payment = {
   created_at: string;
   // Банк плательщика — приходит в уведомлении Cardlink после оплаты
   bank?: string | null;
+  details?: PaymentDetails;
 };
+
+// Подробности из уведомления Cardlink (приходят с историей)
+type PaymentDetails = {
+  transaction_id: string | null;
+  paid_at: string | null;
+  method: string | null;
+  bank: string | null;
+  amount: number | null;
+  commission: number | null;
+  balance_amount: number | null;
+  error_message: string | null;
+};
+
+const METHOD_LABEL: Record<string, string> = { SBP: "СБП", BANK_CARD: "Банковская карта" };
+
+function fmtDateTime(value: string) {
+  return new Date(value).toLocaleString("ru-RU", {
+    day: "2-digit",
+    month: "2-digit",
+    year: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
+}
+
+function detailRows(p: Payment) {
+  const d = p.details;
+  const kopecks = (value: number | null | undefined) =>
+    value === null || value === undefined
+      ? "—"
+      : `${value.toLocaleString("ru-RU", { minimumFractionDigits: 2, maximumFractionDigits: 2 })} ₽`;
+  return [
+    { label: "ID транзакции", value: d?.transaction_id || "—" },
+    { label: "Дата и время", value: fmtDateTime(d?.paid_at || p.created_at) },
+    { label: "Способ оплаты", value: d?.method ? METHOD_LABEL[d.method] ?? d.method : "—" },
+    { label: "Банк", value: d?.bank || "—" },
+    { label: "Сумма", value: kopecks(d?.amount ?? p.amount) },
+    { label: "Комиссия", value: kopecks(d?.commission) },
+    { label: "К зачислению", value: kopecks(d?.balance_amount) },
+    ...(d?.error_message ? [{ label: "Причина отказа", value: d.error_message }] : []),
+  ];
+}
 
 // Статусы счёта Cardlink
 const STATUS: Record<string, { label: string; color: string }> = {
@@ -166,6 +210,26 @@ async function saveImage(blob: Blob, fileName: string) {
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
+type Balance = {
+  currency: string;
+  balance_available: string;
+  balance_locked: string;
+  balance_hold: string;
+};
+
+const BALANCE_FIELDS: { key: keyof Balance; label: string }[] = [
+  { key: "balance_available", label: "Доступно" },
+  { key: "balance_locked", label: "Заблокировано" },
+  { key: "balance_hold", label: "Удержано" },
+];
+
+const CURRENCY_SIGN: Record<string, string> = { RUB: "₽", USD: "$", EUR: "€" };
+
+function money(value: string, currency: string) {
+  const amount = Number(value).toLocaleString("ru-RU", { maximumFractionDigits: 2 });
+  return `${amount} ${CURRENCY_SIGN[currency] ?? currency}`;
+}
+
 const inputClass =
   "w-full h-14 bg-white/[0.04] border border-white/10 rounded-[18px] px-5 text-[16px] text-white outline-none focus:border-[#12c83b]/50 transition-colors placeholder:text-neutral-600";
 
@@ -204,6 +268,12 @@ export function PaymentQrModal({ onClose }: { onClose: () => void }) {
   const [historyError, setHistoryError] = useState("");
   const [current, setCurrent] = useState<Payment | null>(null);
   const [saved, setSaved] = useState(false);
+  const [expandedId, setExpandedId] = useState<string | null>(null);
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const [isBalanceOpen, setIsBalanceOpen] = useState(false);
+  const [balances, setBalances] = useState<Balance[]>([]);
+  const [isBalanceLoading, setIsBalanceLoading] = useState(false);
+  const [balanceError, setBalanceError] = useState("");
   const qrRef = useRef<HTMLDivElement>(null);
   const [daysAgo, setDaysAgo] = useState(0);
   // Номер последнего запроса: ответ за прошлый выбранный день не должен затереть текущий
@@ -266,9 +336,26 @@ export function PaymentQrModal({ onClose }: { onClose: () => void }) {
     }
   };
 
-  const openPayment = (item: Payment) => {
-    if (!item.link_url) return;
+  const showQr = (item: Payment) => {
     setCurrent(item);
+    scrollRef.current?.scrollTo({ top: 0, behavior: "smooth" });
+  };
+
+  // Баланс запрашиваем только по нажатию: каждый запрос идёт в API Cardlink через платный прокси
+  const toggleBalance = async () => {
+    if (isBalanceOpen) return setIsBalanceOpen(false);
+    setIsBalanceOpen(true);
+    setBalanceError("");
+    setIsBalanceLoading(true);
+    try {
+      const result = await post({ action: "getBalance" });
+      if (result.success) setBalances(result.balances);
+      else setBalanceError(result.error || "Не удалось получить баланс");
+    } catch {
+      setBalanceError("Нет связи с сервером");
+    } finally {
+      setIsBalanceLoading(false);
+    }
   };
 
   const downloadQr = async () => {
@@ -306,6 +393,18 @@ export function PaymentQrModal({ onClose }: { onClose: () => void }) {
         </div>
         <motion.button
           whileTap={{ scale: 0.9 }}
+          onClick={toggleBalance}
+          style={{ WebkitTapHighlightColor: "transparent" }}
+          className={`h-12 w-12 rounded-full border flex items-center justify-center shrink-0 transition-colors ${
+            isBalanceOpen
+              ? "border-[#12c83b]/30 bg-[#12c83b]/15 text-[#12c83b]"
+              : "border-white/10 bg-white/[0.06] text-white"
+          }`}
+        >
+          <Wallet size={20} />
+        </motion.button>
+        <motion.button
+          whileTap={{ scale: 0.9 }}
           onClick={onClose}
           style={{ WebkitTapHighlightColor: "transparent" }}
           className="h-12 w-12 rounded-full border border-white/10 bg-white/[0.06] text-white flex items-center justify-center shrink-0"
@@ -314,10 +413,47 @@ export function PaymentQrModal({ onClose }: { onClose: () => void }) {
         </motion.button>
       </div>
 
+      {isBalanceOpen && (
+        <div className="shrink-0 px-5 py-4 bg-[#1a1a1c] border-b border-white/5">
+          <div className="mb-2 text-[13px] font-semibold uppercase tracking-wider text-neutral-500">Баланс Cardlink</div>
+          {isBalanceLoading ? (
+            <div className="flex justify-center py-3">
+              <Loader2 size={20} className="animate-spin text-neutral-500" />
+            </div>
+          ) : balanceError ? (
+            <div className="text-[14px] text-red-400">{balanceError}</div>
+          ) : balances.length === 0 ? (
+            <div className="text-[14px] text-neutral-500">Баланса нет</div>
+          ) : (
+            <div className="flex flex-col gap-3">
+              {balances.map((b) => (
+                <div key={b.currency} className="grid grid-cols-3 gap-2">
+                  {BALANCE_FIELDS.map(({ key, label }) => (
+                    <div key={key} className="px-3 py-2.5 rounded-[14px] bg-white/[0.04] border border-white/5">
+                      <div className="text-[11px] text-neutral-500">{label}</div>
+                      <div
+                        className={`text-[15px] font-bold truncate ${
+                          key === "balance_available" ? "text-[#12c83b]" : "text-white"
+                        }`}
+                      >
+                        {money(b[key], b.currency)}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
       <div
-        className="flex-1 overflow-y-auto px-5 pt-6"
-        style={{ paddingBottom: "calc(env(safe-area-inset-bottom, 0px) + 24px)" }}
+        ref={scrollRef}
+        className="flex-1 overflow-y-auto hide-scrollbar px-5 pt-6"
+        style={{ paddingBottom: "calc(env(safe-area-inset-bottom, 0px) + 24px)", scrollbarWidth: "none" }}
       >
+        {/* Полосы прокрутки прячем: в Chrome/Safari — через стиль, в Firefox — через scrollbarWidth */}
+        <style>{`.hide-scrollbar::-webkit-scrollbar { display: none; }`}</style>
         {current ? (
           <div className="flex flex-col items-center gap-4 p-5 rounded-[28px] bg-[#1a1a1c] border border-white/5">
             <div className="w-full flex flex-col items-center px-5 pt-5 pb-4 bg-white rounded-[24px]">
@@ -410,8 +546,10 @@ export function PaymentQrModal({ onClose }: { onClose: () => void }) {
           </motion.button>
         </div>
 
-        <style>{`.hide-scrollbar::-webkit-scrollbar { display: none; }`}</style>
-        <div className="-mx-5 mb-3 px-5 flex gap-2 overflow-x-auto hide-scrollbar touch-pan-x">
+        <div
+          className="-mx-5 mb-3 px-5 flex gap-2 overflow-x-auto hide-scrollbar touch-pan-x"
+          style={{ scrollbarWidth: "none" }}
+        >
           {Array.from({ length: HISTORY_DAYS }, (_, day) => (
             <motion.button
               key={day}
@@ -442,31 +580,60 @@ export function PaymentQrModal({ onClose }: { onClose: () => void }) {
         ) : (
           <div className="flex flex-col gap-2">
             {history.map((p) => {
-              const canOpen = Boolean(p.link_url);
+              const isExpanded = p.id === expandedId;
               return (
-                <motion.button
+                <div
                   key={p.id}
-                  whileTap={canOpen ? { scale: 0.98 } : undefined}
-                  onClick={() => openPayment(p)}
-                  style={{ WebkitTapHighlightColor: "transparent" }}
-                  className={`w-full flex items-center gap-3 px-4 py-3 rounded-[18px] border text-left transition-colors ${
-                    p.id === current?.id
-                      ? "bg-white/[0.07] border-white/15"
-                      : "bg-white/[0.03] border-white/5"
-                  } ${canOpen ? "" : "cursor-default"}`}
+                  className={`rounded-[18px] border transition-colors ${
+                    isExpanded || p.id === current?.id ? "bg-white/[0.07] border-white/15" : "bg-white/[0.03] border-white/5"
+                  }`}
                 >
-                  <div className="min-w-0 flex-1">
-                    <div className={`text-[15px] font-semibold truncate ${p.client_name ? "text-white" : "text-neutral-500"}`}>
-                      {p.client_name || "Без имени"}
+                  <motion.button
+                    whileTap={{ scale: 0.98 }}
+                    onClick={() => setExpandedId(isExpanded ? null : p.id)}
+                    style={{ WebkitTapHighlightColor: "transparent" }}
+                    className="w-full flex items-center gap-3 px-4 py-3 text-left"
+                  >
+                    <div className="min-w-0 flex-1">
+                      <div className={`text-[15px] font-semibold truncate ${p.client_name ? "text-white" : "text-neutral-500"}`}>
+                        {p.client_name || "Без имени"}
+                      </div>
+                      <div className="text-[12px] text-neutral-500 truncate">
+                        {fmtDate(p.created_at)}
+                        {p.bank ? ` · ${p.bank}` : ""}
+                      </div>
                     </div>
-                    <div className="text-[12px] text-neutral-500 truncate">
-                      {fmtDate(p.created_at)}
-                      {p.bank ? ` · ${p.bank}` : ""}
+                    <div className="text-[15px] font-semibold text-white shrink-0">{rub(p.amount)}</div>
+                    <StatusBadge status={p.status} />
+                    <ChevronDown
+                      size={16}
+                      className={`shrink-0 text-neutral-500 transition-transform ${isExpanded ? "rotate-180" : ""}`}
+                    />
+                  </motion.button>
+
+                  {isExpanded && (
+                    <div className="px-4 pb-4">
+                      <div className="border-t border-white/5 pt-3 flex flex-col gap-2">
+                        {detailRows(p).map((row) => (
+                          <div key={row.label} className="flex items-start justify-between gap-4 text-[14px]">
+                            <span className="text-neutral-500 shrink-0">{row.label}</span>
+                            <span className="text-white text-right break-all">{row.value}</span>
+                          </div>
+                        ))}
+                      </div>
+                      {p.link_url && (
+                        <motion.button
+                          whileTap={{ scale: 0.97 }}
+                          onClick={() => showQr(p)}
+                          style={{ WebkitTapHighlightColor: "transparent" }}
+                          className="mt-3 w-full h-11 rounded-full border border-white/10 bg-white/[0.06] text-white text-[14px] flex items-center justify-center gap-2"
+                        >
+                          <QrCode size={16} /> Показать QR
+                        </motion.button>
+                      )}
                     </div>
-                  </div>
-                  <div className="text-[15px] font-semibold text-white shrink-0">{rub(p.amount)}</div>
-                  <StatusBadge status={p.status} />
-                </motion.button>
+                  )}
+                </div>
               );
             })}
           </div>

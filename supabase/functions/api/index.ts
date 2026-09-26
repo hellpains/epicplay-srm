@@ -6,6 +6,11 @@ const SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "";
 const TG_TOKEN = Deno.env.get("TG_TOKEN") ?? "";
 const TG_CHAT_ID = Deno.env.get("TG_CHAT_ID") ?? "";
 const CARDLINK_TOKEN = Deno.env.get("CARDLINK_TOKEN") ?? "";
+// API Cardlink пускает только IP из вайтлиста, поэтому ходим в него через прокси Fixie
+// с постоянными адресами: http://user:pass@host:port. Используется только для баланса.
+const FIXIE_URL = Deno.env.get("FIXIE_URL") ?? "";
+const CARDLINK_API = "https://cardlink.link/api/v1";
+const PROXY_TIMEOUT_MS = 20_000;
 // Многоразовая ссылка Cardlink и робот на Vercel, который вводит в неё сумму
 // и возвращает прямую ссылку СБП (qr.nspk.ru)
 const CARDLINK_TRANSFER_URL = Deno.env.get("CARDLINK_TRANSFER_URL") ?? "";
@@ -1954,7 +1959,7 @@ async function handleGetPayments(data: any) {
 
   const { data: rows, error } = await db
     .from("payments")
-    .select("*")
+    .select("*, postback:cardlink_postbacks(fields, created_at)")
     .gte("created_at", from.toISOString())
     .lt("created_at", to.toISOString())
     .order("created_at", { ascending: false })
@@ -1973,7 +1978,190 @@ async function handleGetPayments(data: any) {
     ),
   );
 
-  return json({ success: true, payments: rows ?? [] });
+  return json({ success: true, payments: (rows ?? []).map(withDetails) });
+}
+
+// Подробности платежа для раскрытой строки истории — из уведомления Cardlink, без запросов в API.
+// Номера транзакции в уведомлении нет: он известен только для QR из приложения.
+function withDetails(row: any) {
+  const { postback, ...payment } = row;
+  const fields = postback?.fields ?? {};
+  const number = (value: unknown) => (str(value) === "" ? null : Number(value));
+  return {
+    ...payment,
+    details: {
+      transaction_id: isSbpPayment(row) ? row.bill_id : null,
+      paid_at: postback?.created_at ?? null,
+      method: str(fields.AccountType) || (isSbpPayment(row) ? "SBP" : null),
+      bank: str(fields.AccountBank) || row.bank || null,
+      amount: number(fields.OutSum) ?? Number(row.amount),
+      commission: number(fields.Commission),
+      balance_amount: number(fields.BalanceAmount),
+      error_message: str(fields.ErrorMessage) || null,
+    },
+  };
+}
+
+// ---------- API Cardlink через прокси ----------
+
+function concatBytes(parts: Uint8Array[]) {
+  const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+  let offset = 0;
+  for (const p of parts) {
+    out.set(p, offset);
+    offset += p.length;
+  }
+  return out;
+}
+
+function indexOfHeaderEnd(bytes: Uint8Array) {
+  for (let i = 0; i + 3 < bytes.length; i++) {
+    if (bytes[i] === 13 && bytes[i + 1] === 10 && bytes[i + 2] === 13 && bytes[i + 3] === 10) return i;
+  }
+  return -1;
+}
+
+async function writeAll(conn: Deno.Conn, bytes: Uint8Array) {
+  let written = 0;
+  while (written < bytes.length) written += await conn.write(bytes.subarray(written));
+}
+
+function dechunk(bytes: Uint8Array) {
+  const parts: Uint8Array[] = [];
+  const dec = new TextDecoder();
+  let pos = 0;
+  while (pos < bytes.length) {
+    let lineEnd = pos;
+    while (lineEnd + 1 < bytes.length && !(bytes[lineEnd] === 13 && bytes[lineEnd + 1] === 10)) lineEnd++;
+    const size = parseInt(dec.decode(bytes.subarray(pos, lineEnd)).split(";")[0], 16);
+    if (!size) break;
+    parts.push(bytes.subarray(lineEnd + 2, lineEnd + 2 + size));
+    pos = lineEnd + 2 + size + 2;
+  }
+  return concatBytes(parts);
+}
+
+// HTTPS-запрос через HTTP-прокси (туннель CONNECT). Cardlink пускает только IP из вайтлиста,
+// а у функции IP меняется, поэтому ходим через Fixie с постоянными адресами.
+async function fetchViaProxy(
+  target: URL,
+  method: string,
+  headers: Record<string, string>,
+  body: string,
+): Promise<{ status: number; text: string }> {
+  const proxy = new URL(FIXIE_URL);
+  const enc = new TextEncoder();
+  const conn = await Deno.connect({ hostname: proxy.hostname, port: Number(proxy.port || 80) });
+  let stream: Deno.Conn = conn;
+  const timer = setTimeout(() => {
+    try {
+      stream.close();
+    } catch (_e) {
+      // уже закрыто
+    }
+  }, PROXY_TIMEOUT_MS);
+
+  try {
+    const auth = btoa(`${decodeURIComponent(proxy.username)}:${decodeURIComponent(proxy.password)}`);
+    await writeAll(
+      conn,
+      enc.encode(
+        `CONNECT ${target.hostname}:443 HTTP/1.1\r\nHost: ${target.hostname}:443\r\n` +
+          `Proxy-Authorization: Basic ${auth}\r\n\r\n`,
+      ),
+    );
+
+    const buf = new Uint8Array(4096);
+    let head = new Uint8Array(0);
+    while (indexOfHeaderEnd(head) < 0) {
+      const n = await conn.read(buf);
+      if (n === null) throw new Error("прокси закрыл соединение");
+      head = concatBytes([head, buf.slice(0, n)]);
+    }
+    const proxyStatus = new TextDecoder().decode(head).split("\r\n")[0];
+    if (!/^HTTP\/1\.[01] 200/.test(proxyStatus)) throw new Error(`прокси ответил: ${proxyStatus}`);
+
+    stream = await Deno.startTls(conn, { hostname: target.hostname });
+    const bodyBytes = enc.encode(body);
+    const lines = [
+      `${method} ${target.pathname}${target.search} HTTP/1.1`,
+      `Host: ${target.hostname}`,
+      "Connection: close",
+      ...Object.entries(headers).map(([k, v]) => `${k}: ${v}`),
+      ...(method === "POST" ? [`Content-Length: ${bodyBytes.length}`] : []),
+    ];
+    await writeAll(stream, concatBytes([enc.encode(lines.join("\r\n") + "\r\n\r\n"), bodyBytes]));
+
+    const parts: Uint8Array[] = [];
+    while (true) {
+      const n = await stream.read(buf);
+      if (n === null) break;
+      parts.push(buf.slice(0, n));
+    }
+    const raw = concatBytes(parts);
+    const headerEnd = indexOfHeaderEnd(raw);
+    if (headerEnd < 0) throw new Error("пустой ответ Cardlink");
+    const responseHead = new TextDecoder().decode(raw.subarray(0, headerEnd));
+    let responseBody = raw.subarray(headerEnd + 4);
+    if (/\r\ntransfer-encoding:\s*chunked/i.test(responseHead)) responseBody = dechunk(responseBody);
+
+    return {
+      status: Number(responseHead.split(" ")[1]) || 0,
+      text: new TextDecoder().decode(responseBody),
+    };
+  } finally {
+    clearTimeout(timer);
+    try {
+      stream.close();
+    } catch (_e) {
+      // уже закрыто
+    }
+  }
+}
+
+async function cardlink(method: "GET" | "POST", path: string, params: Record<string, string>) {
+  const query = new URLSearchParams(params);
+  const target = new URL(`${CARDLINK_API}${path}${method === "GET" ? `?${query}` : ""}`);
+  const headers: Record<string, string> = {
+    Authorization: `Bearer ${CARDLINK_TOKEN}`,
+    Accept: "application/json",
+    ...(method === "POST" ? { "Content-Type": "application/x-www-form-urlencoded" } : {}),
+  };
+  const payload = method === "POST" ? query.toString() : "";
+
+  let status: number;
+  let text: string;
+  if (FIXIE_URL) {
+    ({ status, text } = await fetchViaProxy(target, method, headers, payload));
+  } else {
+    const response = await fetch(target, { method, headers, body: payload || undefined });
+    status = response.status;
+    text = await response.text();
+  }
+
+  let body: any = {};
+  try {
+    body = JSON.parse(text);
+  } catch (_e) {
+    body = {};
+  }
+  if (status < 200 || status >= 300 || body.success === false || body.success === "false") {
+    throw new Error(body.message || body.error || `Cardlink ответил ${status}`);
+  }
+  return body;
+}
+
+// Баланс магазина в Cardlink — запрашивается только по кнопке, каждый раз один запрос через прокси
+async function handleGetBalance() {
+  if (!CARDLINK_TOKEN || !FIXIE_URL) {
+    return json({ success: false, error: "Баланс не настроен на сервере" }, 500);
+  }
+  try {
+    const result = await cardlink("GET", "/merchant/balance", {});
+    return json({ success: true, balances: Array.isArray(result.balances) ? result.balances : [] });
+  } catch (e) {
+    return json({ success: false, error: `Не удалось получить баланс: ${(e as Error).message}` }, 502);
+  }
 }
 
 async function md5Hex(text: string) {
@@ -2139,6 +2327,8 @@ Deno.serve(async (req) => {
           return await handleMarkProblem(data, false);
         case "createPayment":
           return await handleCreatePayment(data);
+        case "getBalance":
+          return await handleGetBalance();
         case "getPayments":
           return await handleGetPayments(data);
         default:
