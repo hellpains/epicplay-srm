@@ -11,6 +11,12 @@ const CARDLINK_TOKEN = Deno.env.get("CARDLINK_TOKEN") ?? "";
 const FIXIE_URL = Deno.env.get("FIXIE_URL") ?? "";
 const CARDLINK_API = "https://cardlink.link/api/v1";
 const PROXY_TIMEOUT_MS = 20_000;
+// Чаты Авито: ключи приложения из кабинета Авито (Настройки → API)
+const AVITO_CLIENT_ID = Deno.env.get("AVITO_CLIENT_ID") ?? "";
+const AVITO_CLIENT_SECRET = Deno.env.get("AVITO_CLIENT_SECRET") ?? "";
+const AVITO_API = "https://api.avito.ru";
+// Секрет в адресе веб-хука: Авито не подписывает уведомления, поэтому чужие запросы отсекаем по ключу
+const AVITO_WEBHOOK_KEY = Deno.env.get("AVITO_WEBHOOK_KEY") ?? "";
 // Многоразовая ссылка Cardlink и робот на Vercel, который вводит в неё сумму
 // и возвращает прямую ссылку СБП (qr.nspk.ru)
 const CARDLINK_TRANSFER_URL = Deno.env.get("CARDLINK_TRANSFER_URL") ?? "";
@@ -705,6 +711,7 @@ async function handleAddOrder(data: any) {
       slot: data.slot,
       price: parsePrice(data.price),
       payment_method: data.paymentMethod ?? "",
+      avito_chat_id: str(data.avitoChatId) || null,
       employee: data.employee ?? "",
       created_at: finalDate,
     })
@@ -795,13 +802,14 @@ async function handleGetSlotHistory(data: any) {
   const target = (data.login ?? "").toString().trim().toLowerCase();
   const { data: rows } = await db
     .from("orders")
-    .select("id, client, slot, slot_field, created_at, price, event")
+    .select("id, client, slot, slot_field, avito_chat_id, created_at, price, event")
     .ilike("login", target)
     .order("created_at", { ascending: true });
 
   const history = (rows ?? []).map((r: any) => ({
     id: r.id,
     slotField: r.slot_field ?? null,
+    avitoChatId: r.avito_chat_id ?? null,
     client: r.client ?? "",
     slot: r.slot ?? "",
     date: fmtDate(r.created_at),
@@ -2431,14 +2439,259 @@ async function applyPostback(postbackId: number, fields: Record<string, string>)
   if (insertError) throw insertError;
 }
 
+// ---------- Чаты Авито ----------
+
+// Ключ доступа живёт сутки; держим его в памяти функции и берём новый заранее
+let avitoToken: { value: string; expiresAt: number } | null = null;
+let avitoUserId: number | null = null;
+
+async function getAvitoToken(force = false) {
+  if (!force && avitoToken && avitoToken.expiresAt > Date.now() + 60_000) return avitoToken.value;
+  if (!AVITO_CLIENT_ID || !AVITO_CLIENT_SECRET) throw new Error("Ключи Авито не настроены на сервере");
+  const response = await fetch(`${AVITO_API}/token`, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      grant_type: "client_credentials",
+      client_id: AVITO_CLIENT_ID,
+      client_secret: AVITO_CLIENT_SECRET,
+    }),
+  });
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok || !body.access_token) {
+    throw new Error(body.error_description || body.error || `Авито не выдало доступ (${response.status})`);
+  }
+  avitoToken = { value: body.access_token, expiresAt: Date.now() + (Number(body.expires_in) || 3600) * 1000 };
+  return avitoToken.value;
+}
+
+async function avito(method: "GET" | "POST", path: string, payload?: unknown) {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const token = await getAvitoToken(attempt > 0);
+    const response = await fetch(`${AVITO_API}${path}`, {
+      method,
+      headers: {
+        Authorization: `Bearer ${token}`,
+        ...(payload !== undefined ? { "Content-Type": "application/json" } : {}),
+      },
+      body: payload !== undefined ? JSON.stringify(payload) : undefined,
+    });
+    // Ключ мог истечь раньше срока — один раз берём новый
+    if (response.status === 401 && attempt === 0) continue;
+    const text = await response.text();
+    let data: any = {};
+    try {
+      data = text ? JSON.parse(text) : {};
+    } catch (_e) {
+      data = {};
+    }
+    if (!response.ok) {
+      throw new Error(data?.error?.message || data?.message || `Авито ответило ${response.status}`);
+    }
+    return data;
+  }
+  throw new Error("Авито не принимает ключ доступа");
+}
+
+async function getAvitoUserId() {
+  if (avitoUserId) return avitoUserId;
+  const me = await avito("GET", "/core/v1/accounts/self");
+  avitoUserId = Number(me.id);
+  return avitoUserId;
+}
+
+// Текст сообщения для списка и переписки — у нетекстовых сообщений подпись по типу
+function avitoMessageText(message: any) {
+  const c = message?.content ?? {};
+  switch (message?.type) {
+    case "text":
+      return str(c.text);
+    case "image":
+      return "📷 Фото";
+    case "item":
+      return `Объявление: ${str(c.item?.title)}`;
+    case "link":
+      return str(c.link?.text) || str(c.link?.url);
+    case "location":
+      return `📍 ${str(c.location?.text) || str(c.location?.title)}`;
+    case "call":
+      return "📞 Пропущенный звонок";
+    case "voice":
+      return "🎤 Голосовое сообщение";
+    case "deleted":
+      return "Сообщение удалено";
+    default:
+      return str(c.text) || "Системное сообщение";
+  }
+}
+
+// Самая крупная картинка из набора размеров ("1280x960": url, ...)
+function avitoLargestImage(sizes: Record<string, string> | undefined) {
+  const entries = Object.entries(sizes ?? {});
+  if (entries.length === 0) return "";
+  entries.sort((a, b) => {
+    const area = (key: string) => key.split("x").reduce((n, v) => n * (Number(v) || 0), 1);
+    return area(b[0]) - area(a[0]);
+  });
+  return entries[0][1];
+}
+
+function avitoChatSummary(chat: any, myId: number, unread = false) {
+  const other = (chat.users ?? []).find((u: any) => Number(u.id) !== myId) ?? {};
+  const item = chat.context?.type === "item" ? chat.context.value ?? {} : {};
+  const last = chat.last_message;
+  return {
+    id: chat.id,
+    name: str(other.name) || "Пользователь Авито",
+    avatar: str(other.public_user_profile?.avatar?.default),
+    itemTitle: str(item.title),
+    itemPrice: str(item.price_string),
+    itemImage: str(item.images?.main?.["140x105"]),
+    itemUrl: str(item.url),
+    lastText: last ? avitoMessageText(last) : "",
+    lastDirection: str(last?.direction),
+    updated: Number(chat.updated || last?.created || chat.created) || 0,
+    unread,
+  };
+}
+
+const AVITO_CHATS_PAGE = 50;
+
+async function handleAvitoChats(data: any) {
+  const uid = await getAvitoUserId();
+  await ensureAvitoWebhook().catch((e) => console.error("avito subscribe:", (e as Error).message));
+  const offset = Math.max(0, Number(data.offset) || 0);
+  const base = `/messenger/v2/accounts/${uid}/chats?chat_types=u2i,u2u`;
+  // Непрочитанные отдельным запросом: в общем списке отметки «прочитано» нет
+  const [all, unread] = await Promise.all([
+    avito("GET", `${base}&limit=${AVITO_CHATS_PAGE}&offset=${offset}`),
+    avito("GET", `${base}&limit=100&unread_only=true`),
+  ]);
+  const unreadIds = new Set((unread.chats ?? []).map((c: any) => c.id));
+  const chats = (all.chats ?? []).map((c: any) => avitoChatSummary(c, uid, unreadIds.has(c.id)));
+  return json({ success: true, chats, hasMore: (all.chats ?? []).length === AVITO_CHATS_PAGE });
+}
+
+async function handleAvitoMessages(data: any) {
+  const uid = await getAvitoUserId();
+  const chatId = encodeURIComponent(str(data.chatId));
+  if (!chatId) return json({ success: false, error: "Не указан чат" }, 400);
+  const [chat, list] = await Promise.all([
+    avito("GET", `/messenger/v2/accounts/${uid}/chats/${chatId}`),
+    avito("GET", `/messenger/v3/accounts/${uid}/chats/${chatId}/messages/?limit=100`),
+  ]);
+  // Получение сообщений не отмечает чат прочитанным — делаем это явно
+  if (data.markRead !== false) {
+    await avito("POST", `/messenger/v1/accounts/${uid}/chats/${chatId}/read`).catch(() => {});
+  }
+  const messages = (Array.isArray(list) ? list : list.messages ?? [])
+    .map((m: any) => ({
+      id: m.id,
+      direction: m.direction,
+      type: m.type,
+      text: m.type === "image" ? "" : avitoMessageText(m),
+      image: m.type === "image" ? avitoLargestImage(m.content?.image?.sizes) : "",
+      created: Number(m.created) || 0,
+      isRead: Boolean(m.is_read),
+    }))
+    .sort((a: any, b: any) => a.created - b.created);
+  return json({ success: true, chat: avitoChatSummary(chat, uid), messages });
+}
+
+async function handleAvitoSend(data: any) {
+  const uid = await getAvitoUserId();
+  const chatId = encodeURIComponent(str(data.chatId));
+  const text = str(data.text);
+  if (!chatId || !text) return json({ success: false, error: "Пустое сообщение" }, 400);
+  const sent = await avito("POST", `/messenger/v1/accounts/${uid}/chats/${chatId}/messages`, {
+    message: { text },
+    type: "text",
+  });
+  return json({
+    success: true,
+    message: {
+      id: sent.id,
+      direction: "out",
+      type: "text",
+      text: str(sent.content?.text) || text,
+      image: "",
+      created: Number(sent.created) || Math.floor(Date.now() / 1000),
+      isRead: false,
+    },
+  });
+}
+
+// ---------- Веб-хук Авито ----------
+
+function avitoWebhookUrl() {
+  return `${SUPABASE_URL}/functions/v1/api?avito=webhook&key=${encodeURIComponent(AVITO_WEBHOOK_KEY)}`;
+}
+
+// Подписка на уведомления: проверяем один раз на экземпляр функции, подписываемся, если нашего адреса нет
+let avitoWebhookChecked = false;
+async function ensureAvitoWebhook() {
+  if (avitoWebhookChecked || !AVITO_WEBHOOK_KEY) return;
+  const url = avitoWebhookUrl();
+  const current = await avito("POST", "/messenger/v1/subscriptions");
+  const subscribed = (current.subscriptions ?? []).some((sub: any) => sub.url === url);
+  if (!subscribed) await avito("POST", "/messenger/v3/webhook", { url });
+  avitoWebhookChecked = true;
+}
+
+// Уведомление Авито о новом сообщении: сохраняем событие, приложение по нему обновит чаты.
+// Отвечаем 200 всегда и быстро (у Авито таймаут 2 секунды), иначе оно перестанет слать уведомления
+async function handleAvitoWebhook(req: Request, key: string) {
+  if (!AVITO_WEBHOOK_KEY || key !== AVITO_WEBHOOK_KEY) return new Response("forbidden", { status: 403 });
+  const body = await req.json().catch(() => ({}));
+  const value = body?.payload?.value;
+  if (body?.payload?.type === "message" && value?.chat_id) {
+    const { error } = await db.from("avito_events").insert({
+      message_id: str(value.id) || null,
+      chat_id: str(value.chat_id),
+      author_id: Number(value.author_id) || null,
+      type: str(value.type),
+      text: str(value.content?.text),
+      payload: body,
+    });
+    // Повтор того же уведомления упрётся в unique message_id — это нормально
+    if (error && error.code !== "23505") console.error("avito webhook:", error.message);
+  }
+  return new Response("ok");
+}
+
+// Последнее событие веб-хука (и по какому чату) — приложение сравнивает и перезагружает чаты
+async function handleAvitoEvents() {
+  const { data, error } = await db
+    .from("avito_events")
+    .select("id, chat_id")
+    .order("id", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  if (error) throw error;
+  return json({ success: true, lastId: data?.id ?? 0, lastChatId: data?.chat_id ?? "" });
+}
+
+// Ошибки Авито показываем в приложении текстом, а не как сбой сервера
+async function avitoAction(run: () => Promise<Response>) {
+  try {
+    return await run();
+  } catch (e) {
+    return json({ success: false, error: (e as Error).message }, 502);
+  }
+}
+
 Deno.serve(async (req) => {
   if (req.method === "OPTIONS") {
     return new Response("ok", { headers: CORS });
   }
 
   try {
-    if (new URL(req.url).searchParams.get("cardlink") === "postback") {
+    const params = new URL(req.url).searchParams;
+    if (params.get("cardlink") === "postback") {
       return await handleCardlinkPostback(req);
+    }
+    if (params.get("avito") === "webhook") {
+      return await handleAvitoWebhook(req, params.get("key") ?? "");
     }
 
     let data: any = {};
@@ -2516,6 +2769,14 @@ Deno.serve(async (req) => {
           return await handleUpdateOrderPrice(data);
         case "deleteGame":
           return await handleDeleteGame(data);
+        case "avitoChats":
+          return await avitoAction(() => handleAvitoChats(data));
+        case "avitoMessages":
+          return await avitoAction(() => handleAvitoMessages(data));
+        case "avitoSend":
+          return await avitoAction(() => handleAvitoSend(data));
+        case "avitoEvents":
+          return await handleAvitoEvents();
         case "addEmptyAccount":
           return await handleAddEmptyAccount(data);
         case "markProblem":

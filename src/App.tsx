@@ -1,8 +1,8 @@
 import {useState, useEffect} from "react";
 import {AnimatePresence, motion} from "framer-motion";
-import {Menu, Gamepad2, Plus, Copy, User, LockKeyhole} from "lucide-react";
+import {Menu, MessageCircle, Plus, Copy, User, LockKeyhole} from "lucide-react";
 import CatalogScreen from "./CatalogScreen";
-import EmptyAccountsScreen from "./EmptyAccountsScreen";
+import AvitoChatScreen from "./AvitoChatScreen";
 import AddOrderModal from "./AddOrderModal";
 import ActivityScreen from "./ActivityScreen";
 import {API_URL, AUTH_EXPIRED_EVENT, SESSION_KEY, apiFetch} from "./config";
@@ -135,7 +135,6 @@ export default function App() {
 
     const [currentScreen, setCurrentScreen] = useState<string>("catalog");
     const [items, setItems] = useState<any[]>([]);
-    const [emptyAccounts, setEmptyAccounts] = useState<any[]>([]);
     const [variables, setVariables] = useState<any>({
         employees: [],
         paymentMethods: [],
@@ -174,14 +173,6 @@ export default function App() {
                 }
             }
 
-            if (data.emptyAccounts) {
-                setEmptyAccounts(data.emptyAccounts);
-                localStorage.setItem(
-                    "cached_empty",
-                    JSON.stringify(data.emptyAccounts)
-                );
-            }
-
             if (data.variables) {
                 setVariables(data.variables);
                 localStorage.setItem("cached_vars", JSON.stringify(data.variables));
@@ -198,11 +189,11 @@ export default function App() {
         if (!authUser) return;
 
         const cachedGames = localStorage.getItem("cached_games");
-        const cachedEmpty = localStorage.getItem("cached_empty");
         const cachedVars = localStorage.getItem("cached_vars");
 
         if (cachedGames) setItems(JSON.parse(cachedGames));
-        if (cachedEmpty) setEmptyAccounts(JSON.parse(cachedEmpty));
+        // Раздел «Пустые аккаунты» убран — старый кэш его списка больше не нужен
+        localStorage.removeItem("cached_empty");
         if (cachedVars) setVariables(JSON.parse(cachedVars));
 
         fetchItems(!!cachedGames);
@@ -252,16 +243,7 @@ export default function App() {
                 />
             )}
 
-            {currentScreen === "empty" && (
-                <EmptyAccountsScreen
-                    emptyAccounts={emptyAccounts}
-                    setEmptyAccounts={setEmptyAccounts}
-                    API_URL={API_URL}
-                    isSyncing={isSyncing}
-                    fetchItems={fetchItems}
-                    variables={variables}
-                />
-            )}
+            {currentScreen === "avito" && <AvitoChatScreen/>}
 
             {currentScreen === "templates" && (
                 <TemplatesScreen/>
@@ -293,7 +275,6 @@ export default function App() {
                     <AddOrderModal
                         onClose={() => setCurrentScreen("catalog")}
                         gamesList={items}
-                        emptyAccounts={emptyAccounts}
                         variables={variables}
                         fetchItems={fetchItems}
                         API_URL={API_URL}
@@ -320,9 +301,9 @@ export default function App() {
                             />
 
                             <NavButton
-                                active={currentScreen === "empty"}
-                                icon={<Gamepad2 size={24}/>}
-                                onClick={() => setCurrentScreen("empty")}
+                                active={currentScreen === "avito"}
+                                icon={<MessageCircle size={24}/>}
+                                onClick={() => setCurrentScreen("avito")}
                             />
 
                             <motion.button

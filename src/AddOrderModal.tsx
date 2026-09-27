@@ -1,7 +1,7 @@
 import React, { useState, useRef, useEffect, useMemo } from "react";
 import { apiFetch } from "./config";
 import { motion, AnimatePresence } from "framer-motion";
-import { X, Check, ChevronDown } from "lucide-react";
+import { X, Check, ChevronDown, Loader2 } from "lucide-react";
 import { assignSlotFields, slotNamesFor } from "./slotHistory";
 
 function ResultDialog({
@@ -123,10 +123,18 @@ export default function AddOrderModal({
 
   const [errors, setErrors] = useState<Record<string, boolean>>({});
   // Подсказки для «Клиент» при возврате: кто сейчас занимает слоты этого аккаунта
-  const [slotClients, setSlotClients] = useState<{ client: string; slot: string; field: string; number: number }[]>([]);
+  const [slotClients, setSlotClients] = useState<
+    { client: string; slot: string; field: string; number: number; avitoChatId: string | null }[]
+  >([]);
   // Точный слот клиента (slot1..slot5), выбранного из подсказок, — чтобы освободить именно его
   const [selectedSlotField, setSelectedSlotField] = useState("");
   const [showClientSuggestions, setShowClientSuggestions] = useState(false);
+  // Продажа: подсказки клиентов из последних чатов Авито (грузим один раз при первом фокусе)
+  const [avitoChats, setAvitoChats] = useState<any[] | null>(null);
+  const [isAvitoLoading, setIsAvitoLoading] = useState(false);
+  const [avitoError, setAvitoError] = useState("");
+  // Чат Авито выбранного клиента — сохраняется в заказ, в истории ник станет ссылкой на чат
+  const [avitoChatId, setAvitoChatId] = useState("");
   const searchContainerRef = useRef<HTMLDivElement>(null);
 
   const [toastStatus, setToastStatus] = useState<null | {
@@ -248,9 +256,15 @@ export default function AddOrderModal({
             const occupant = occupants[field];
             if (!occupiedFlags[i] || !occupant?.client) return null;
             const number = names.slice(0, i + 1).filter((n) => n === name).length;
-            return { client: occupant.client, slot: name, field, number: names.filter((n) => n === name).length > 1 ? number : 0 };
+            return {
+              client: occupant.client,
+              slot: name,
+              field,
+              number: names.filter((n) => n === name).length > 1 ? number : 0,
+              avitoChatId: occupant.avitoChatId,
+            };
           })
-          .filter(Boolean) as { client: string; slot: string; field: string; number: number }[];
+          .filter(Boolean) as { client: string; slot: string; field: string; number: number; avitoChatId: string | null }[];
         setSlotClients(list);
       } catch {
         // Без подсказок поле работает как обычно
@@ -316,6 +330,42 @@ export default function AddOrderModal({
       return same ? same.name : "";
     });
   }, [newAccount, newSlotOptions, selectedSlot]);
+
+  const AVITO_SUGGESTIONS = 20;
+
+  const loadAvitoChats = async () => {
+    if (avitoChats !== null || isAvitoLoading) return;
+    setIsAvitoLoading(true);
+    setAvitoError("");
+    try {
+      const response = await apiFetch(API_URL, {
+        method: "POST",
+        body: JSON.stringify({ action: "avitoChats" }),
+      });
+      const result = await response.json().catch(() => ({}));
+      if (!result.success) throw new Error(result.error || "Не удалось загрузить чаты Авито");
+      setAvitoChats((result.chats ?? []).slice(0, AVITO_SUGGESTIONS));
+    } catch (e) {
+      setAvitoError((e as Error).message);
+    } finally {
+      setIsAvitoLoading(false);
+    }
+  };
+
+  const filteredAvitoChats = useMemo(() => {
+    const list = avitoChats ?? [];
+    const q = client.trim().toLowerCase();
+    const isPicked = list.some((c: any) => c.name === client);
+    return q && !isPicked ? list.filter((c: any) => c.name.toLowerCase().includes(q)) : list;
+  }, [avitoChats, client]);
+
+  const avitoTime = (seconds: number) => {
+    if (!seconds) return "";
+    const d = new Date(seconds * 1000);
+    return d.toDateString() === new Date().toDateString()
+      ? d.toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" })
+      : d.toLocaleDateString("ru-RU", { day: "2-digit", month: "2-digit" });
+  };
 
   // Если имя в поле — ровно выбранный клиент со слота, показываем весь список; иначе фильтруем по вводу
   const filteredSlotClients = useMemo(() => {
@@ -476,6 +526,7 @@ const handleSubmit = (e?: React.FormEvent) => {
         edition: newAccount.edition,
         client: client.trim(),
         slot: newSlot,
+        avitoChatId,
         price: price.trim(),
         paymentMethod: price.trim() ? paymentMethod : "",
       });
@@ -542,6 +593,7 @@ const handleSubmit = (e?: React.FormEvent) => {
         requestPayload.price = finalPrice;
         requestPayload.paymentMethod = isReturnOperation || selectedSlot === "Возврат" ? "" : paymentMethod;
         if (isReturnOperation && selectedSlotField) requestPayload.slotField = selectedSlotField;
+        if (avitoChatId) requestPayload.avitoChatId = avitoChatId;
         requestPayload.expense = isNewLogin && expenseValue ? expenseValue : "";
         requestPayload.currency = isNewLogin && expenseValue ? currency : "";
       }
@@ -673,11 +725,15 @@ const handleSubmit = (e?: React.FormEvent) => {
                 value={client}
                 onChange={(e) => {
                   setClient(e.target.value);
+                  setAvitoChatId("");
                   setErrors((prev) => ({ ...prev, client: false }));
                   setShowClientSuggestions(true);
                 }}
                 // onClick — чтобы список открывался и при повторном нажатии на уже активное поле
-                onFocus={() => setShowClientSuggestions(true)}
+                onFocus={() => {
+                  setShowClientSuggestions(true);
+                  if (operation === "Продажа") loadAvitoChats();
+                }}
                 onClick={() => setShowClientSuggestions(true)}
                 onBlur={() => setShowClientSuggestions(false)}
                 placeholder={operation !== "Продажа" && slotClients.length > 0 ? "Выберите клиента со слота" : "Имя или ник"}
@@ -689,8 +745,75 @@ const handleSubmit = (e?: React.FormEvent) => {
               />
               {/* Клиенты на слотах при возврате: выпадают по нажатию на поле, после выбора скрываются */}
               <AnimatePresence>
+                {operation === "Продажа" && showClientSuggestions && (isAvitoLoading || avitoError || filteredAvitoChats.length > 0) && (
+                  <motion.div
+                    key="avito-chats"
+                    initial={{ opacity: 0, y: -5 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    exit={{ opacity: 0, y: -5 }}
+                    className="absolute z-50 top-full left-0 right-0 mt-2 max-h-80 overflow-y-auto bg-[#1c1c1e] border border-white/10 rounded-2xl shadow-[0_12px_40px_rgba(0,0,0,0.6)] custom-scrollbar p-1.5"
+                  >
+                    <div className="px-3 pt-1.5 pb-2 text-[11px] font-bold uppercase tracking-widest text-neutral-500">
+                      Чаты Авито
+                    </div>
+                    {isAvitoLoading ? (
+                      <div className="flex justify-center py-5">
+                        <Loader2 size={20} className="animate-spin text-neutral-500" />
+                      </div>
+                    ) : avitoError ? (
+                      <div className="px-3 pb-3 text-[13px] text-red-400">{avitoError}</div>
+                    ) : (
+                      filteredAvitoChats.map((chat: any) => (
+                        <div
+                          key={chat.id}
+                          // onMouseDown — срабатывает раньше, чем поле потеряет фокус
+                          onMouseDown={(e) => {
+                            e.preventDefault();
+                            setClient(chat.name);
+                            setAvitoChatId(chat.id);
+                            setErrors((prev) => ({ ...prev, client: false }));
+                            setShowClientSuggestions(false);
+                          }}
+                          className={`px-2.5 py-2 flex items-center gap-3 rounded-xl cursor-pointer transition-colors hover:bg-white/5 active:bg-white/10 ${
+                            client === chat.name ? "bg-[#12c83b]/10" : ""
+                          }`}
+                        >
+                          {chat.avatar ? (
+                            <img src={chat.avatar} alt="" className="w-10 h-10 rounded-full object-cover shrink-0 bg-white/5" />
+                          ) : (
+                            <div className="w-10 h-10 rounded-full shrink-0 bg-white/10 flex items-center justify-center text-white font-bold">
+                              {String(chat.name).slice(0, 1).toUpperCase()}
+                            </div>
+                          )}
+                          <div className="min-w-0 flex-1">
+                            <div className="flex items-center justify-between gap-2">
+                              <span className="text-[14px] font-semibold text-white truncate">{chat.name}</span>
+                              <span className={`text-[11px] shrink-0 ${chat.unread ? "text-[#12c83b]" : "text-neutral-500"}`}>
+                                {avitoTime(chat.updated)}
+                              </span>
+                            </div>
+                            {chat.itemTitle && (
+                              <div className="text-[12px] text-neutral-400 truncate">
+                                {chat.itemTitle}
+                                {chat.itemPrice ? ` · ${chat.itemPrice}` : ""}
+                              </div>
+                            )}
+                            <div className="flex items-center justify-between gap-2">
+                              <span className="text-[12px] text-neutral-500 truncate">
+                                {chat.lastDirection === "out" ? "Вы: " : ""}
+                                {chat.lastText}
+                              </span>
+                              {chat.unread && <span className="w-2 h-2 rounded-full bg-[#12c83b] shrink-0" />}
+                            </div>
+                          </div>
+                        </div>
+                      ))
+                    )}
+                  </motion.div>
+                )}
                 {operation !== "Продажа" && showClientSuggestions && filteredSlotClients.length > 0 && (
                   <motion.div
+                    key="slot-clients"
                     initial={{ opacity: 0, y: -5 }}
                     animate={{ opacity: 1, y: 0 }}
                     exit={{ opacity: 0, y: -5 }}
@@ -708,6 +831,7 @@ const handleSubmit = (e?: React.FormEvent) => {
                           onMouseDown={(e) => {
                             e.preventDefault();
                             setClient(c.client);
+                            setAvitoChatId(c.avitoChatId ?? "");
                             setSelectedSlot(c.slot);
                             setSelectedSlotField(c.field);
                             setErrors((prev) => ({ ...prev, client: false, slot: false }));

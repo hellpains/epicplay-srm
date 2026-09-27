@@ -6,6 +6,7 @@
 export type SlotHistoryRow = {
   id?: string;
   slotField?: string | null;
+  avitoChatId?: string | null;
   client: string;
   slot: string;
   date: string;
@@ -13,7 +14,18 @@ export type SlotHistoryRow = {
   event: string;
 };
 
-export type SlotOccupant = { client: string; orderId: string | null; price: number | null; field: string };
+export type SlotOccupant = {
+  client: string;
+  orderId: string | null;
+  price: number | null;
+  field: string;
+  avitoChatId: string | null;
+};
+
+// Ссылка на чат Авито: на телефоне откроется приложение Авито, на компьютере — сайт
+export function avitoChatUrl(chatId: string) {
+  return `https://www.avito.ru/profile/messenger/channel/${encodeURIComponent(chatId)}`;
+}
 
 export function slotNamesFor(hasBoth: boolean) {
   return hasBoth ? ["PS5 П3", "PS5 П3", "PS5 П2", "PS4 П3", "PS4 П2"] : ["П3", "П3", "П2"];
@@ -68,6 +80,7 @@ export function assignSlotFields(history: SlotHistoryRow[], hasBoth: boolean, oc
           orderId: row.event ? null : row.id ?? null,
           price: row.event ? null : row.price,
           field: field!,
+          avitoChatId: row.event ? null : row.avitoChatId ?? null,
         };
     rows.push({ ...row, field });
   }

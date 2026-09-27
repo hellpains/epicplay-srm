@@ -28,7 +28,7 @@ import {
 } from "lucide-react";
 import AddGameModal from "./components/AddGameModal";
 import AddOrderModal from "./AddOrderModal";
-import { assignSlotFields, slotNamesFor, type SlotOccupant } from "./slotHistory";
+import { assignSlotFields, avitoChatUrl, slotNamesFor, type SlotOccupant } from "./slotHistory";
 import PriceTable from "./components/PriceTable";
 import StandardPrices from "./components/StandardPrices";
 import { MyLogo } from "./components/MyLogo";
@@ -378,7 +378,7 @@ export default function CatalogScreen({
                 isOccupied: newOccupied,
                 history: [manualRecord, ...prev.history],
                 occupant: newOccupied
-                  ? { client: "", orderId: null, price: null, field: `slot${prev.slotIndex + 1}` }
+                  ? { client: "", orderId: null, price: null, field: `slot${prev.slotIndex + 1}`, avitoChatId: null }
                   : null,
               }
             : null
@@ -1857,9 +1857,20 @@ export default function CatalogScreen({
                   {historyModal.isOccupied ? (
                     <>
                       <div className="min-w-0">
-                        <div className="text-[15px] font-bold text-white truncate">
-                          {historyModal.occupant?.client || "Клиент не указан"}
-                        </div>
+                        {historyModal.occupant?.avitoChatId ? (
+                          <a
+                            href={avitoChatUrl(historyModal.occupant.avitoChatId)}
+                            target="_blank"
+                            rel="noreferrer"
+                            className="block text-[15px] font-bold text-white truncate underline decoration-white/30 underline-offset-4"
+                          >
+                            {historyModal.occupant.client || "Клиент"}
+                          </a>
+                        ) : (
+                          <div className="text-[15px] font-bold text-white truncate">
+                            {historyModal.occupant?.client || "Клиент не указан"}
+                          </div>
+                        )}
                         <div className="text-[12px] text-[#12c83b]">{historyModal.slotName}</div>
                       </div>
                       {historyModal.occupant?.orderId &&
@@ -1966,9 +1977,20 @@ export default function CatalogScreen({
                         <div className="flex items-center gap-2.5">
                           <div className={`w-1.5 h-1.5 rounded-full ${isReturn ? "bg-red-500" : "bg-green-500"} shadow-[0_0_8px_${isReturn ? 'rgba(239,68,68,0.5)' : 'rgba(34,197,94,0.5)'}]`} />
                           <div className="flex flex-col gap-1">
-                            <span className="text-sm font-semibold text-white leading-none">
-                              {record.client || "Без имени"}
-                            </span>
+                            {record.avitoChatId ? (
+                              <a
+                                href={avitoChatUrl(record.avitoChatId)}
+                                target="_blank"
+                                rel="noreferrer"
+                                className="text-sm font-semibold text-white leading-none underline decoration-white/30 underline-offset-4"
+                              >
+                                {record.client || "Без имени"}
+                              </a>
+                            ) : (
+                              <span className="text-sm font-semibold text-white leading-none">
+                                {record.client || "Без имени"}
+                              </span>
+                            )}
                             <span className={`text-[11px] leading-none ${isReturn ? "text-red-400" : "text-green-400"}`}>
                               {record.slot}
                             </span>
