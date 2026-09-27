@@ -1,8 +1,8 @@
 import {useState, useEffect} from "react";
 import {AnimatePresence, motion} from "framer-motion";
-import {Menu, MessageCircle, Plus, Copy, User, LockKeyhole} from "lucide-react";
+import {Menu, Search, Plus, Copy, User, LockKeyhole} from "lucide-react";
 import CatalogScreen from "./CatalogScreen";
-import AvitoChatScreen from "./AvitoChatScreen";
+import PriceSearchScreen from "./PriceSearchScreen";
 import AddOrderModal from "./AddOrderModal";
 import ActivityScreen from "./ActivityScreen";
 import {API_URL, AUTH_EXPIRED_EVENT, SESSION_KEY, apiFetch} from "./config";
@@ -243,7 +243,12 @@ export default function App() {
                 />
             )}
 
-            {currentScreen === "avito" && <AvitoChatScreen/>}
+            {currentScreen === "prices" && (
+                <PriceSearchScreen
+                    standardPrices={variables.standardPrices ?? {}}
+                    onRatesSaved={() => fetchItems(true)}
+                />
+            )}
 
             {currentScreen === "templates" && (
                 <TemplatesScreen/>
@@ -301,9 +306,9 @@ export default function App() {
                             />
 
                             <NavButton
-                                active={currentScreen === "avito"}
-                                icon={<MessageCircle size={24}/>}
-                                onClick={() => setCurrentScreen("avito")}
+                                active={currentScreen === "prices"}
+                                icon={<Search size={24}/>}
+                                onClick={() => setCurrentScreen("prices")}
                             />
 
                             <motion.button

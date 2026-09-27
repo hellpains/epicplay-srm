@@ -57,37 +57,254 @@ function toBool(v: unknown) {
   return v === true || v === "TRUE" || v === "true";
 }
 
+// Поиск в PlayStation Store — тот же запрос, которым ищет сам сайт магазина (GraphQL getSearchResults).
+// Страница поиска больше не отдаёт результаты в HTML, они приходят отдельным запросом.
+const PS_SEARCH_HASH = "4df6284f982e57bec70f23c77e2c219dc792eb19af7fb3d3a81767aa3f1958aa";
+// Только сами игры и их издания — без скинов, карт, валюты и прочих дополнений
+const PS_GAME_CLASSES = new Set(["FULL_GAME", "PREMIUM_EDITION", "GAME_BUNDLE"]);
+
+// Регионы магазина для поиска. Украинский ищет только по-украински/по-русски, остальные — на своём языке;
+// английские названия игр находятся во всех перечисленных
+const PS_REGIONS: Record<string, { country: string; language: string; locale: string; name: string; currency: string }> = {
+  tr: { country: "TR", language: "en", locale: "en-TR", name: "Турция", currency: "TRY" },
+  ua: { country: "UA", language: "uk", locale: "uk-UA", name: "Украина", currency: "UAH" },
+  in: { country: "IN", language: "en", locale: "en-IN", name: "Индия", currency: "INR" },
+  pl: { country: "PL", language: "pl", locale: "pl-PL", name: "Польша", currency: "PLN" },
+  us: { country: "US", language: "en", locale: "en-US", name: "США", currency: "USD" },
+};
+
+async function psStoreSearch(term: string, size = 24, region = "tr") {
+  const { country, language, locale } = PS_REGIONS[region];
+  const variables = {
+    countryCode: country,
+    languageCode: language,
+    nextCursor: "",
+    pageOffset: 0,
+    pageSize: size,
+    searchTerm: term,
+  };
+  const extensions = { persistedQuery: { version: 1, sha256Hash: PS_SEARCH_HASH } };
+  const url =
+    "https://web.np.playstation.com/api/graphql/v1/op?operationName=getSearchResults" +
+    `&variables=${encodeURIComponent(JSON.stringify(variables))}` +
+    `&extensions=${encodeURIComponent(JSON.stringify(extensions))}`;
+  const response = await fetch(url, {
+    headers: { "content-type": "application/json", "x-psn-store-locale-override": locale },
+  });
+  if (!response.ok) throw new Error(`PlayStation Store ответил ${response.status}`);
+  const body = await response.json().catch(() => ({}));
+  const results = body?.data?.universalSearch?.results ?? [];
+  return results
+    .filter((r: any) => PS_GAME_CLASSES.has(r.storeDisplayClassification))
+    .map((r: any) => {
+      const images: Record<string, string> = {};
+      for (const m of r.media ?? []) if (m.type === "IMAGE" && !images[m.role]) images[m.role] = m.url;
+      // MASTER — квадратная обложка, как на карточках каталога
+      const cover = images.MASTER || images.GAMEHUB_COVER_ART || images.EDITION_KEY_ART || "";
+      return {
+        id: str(r.id),
+        classification: str(r.storeDisplayClassification),
+        price: r.price?.isFree ? "Бесплатно" : str(r.price?.discountedPrice || r.price?.basePrice),
+        basePrice: str(r.price?.basePrice),
+        isFree: Boolean(r.price?.isFree),
+        name: str(r.name),
+        kind: str(r.localizedStoreDisplayClassification),
+        platforms: (r.platforms ?? []).map((pl: string) => str(pl)).filter(Boolean),
+        cover,
+      };
+    })
+    .filter((r: any) => r.name && r.cover);
+}
+
+// Обложка для игры по названию — первая найденная игра в магазине
 async function getPSImageUrl(gameName: string): Promise<string> {
   const name = (gameName ?? "").trim();
   if (!name) return "";
-
-  const query = encodeURIComponent(name);
-  const searchUrl = `https://store.playstation.com/en-tr/search/${query}`;
-
   try {
-    const response = await fetch(searchUrl, {
-      headers: {
-        "User-Agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
-          "(KHTML, like Gecko) Chrome/120.0 Safari/537.36",
-        "Accept-Language": "en-US,en;q=0.9",
-      },
-    });
-    if (!response.ok) return "";
-
-    const html = await response.text();
-    const match = html.match(
-      /src="([^"]+image\.api\.playstation\.com\/vulcan\/ap\/rnd\/[^"]+)"/,
-    );
-
-    if (match && match[1]) {
-      let imageUrl = match[1];
-      if (imageUrl.includes("?")) imageUrl = imageUrl.split("?")[0];
-      return imageUrl;
-    }
-    return "";
+    const found = await psStoreSearch(name, 12);
+    const exact = found.find((r: any) => r.name.toLowerCase() === name.toLowerCase());
+    return (exact ?? found[0])?.cover ?? "";
   } catch (_e) {
     return "";
+  }
+}
+
+// Название для сравнения: без регистра, ударений, «™ ® ©», апострофов и лишних знаков
+// («Battlefield™ 6» = «Battlefield 6», «Ghost of Yōtei» содержит «yotei»)
+function normalizeGameName(value: string) {
+  return value
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/[™®©]/g, "")
+    .replace(/[’'`:,.!?\-–—]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+// Та же игра среди результатов магазина: в названии магазина есть все слова нашего названия
+// (в каталоге названия короткие: «Fc 26» → «EA SPORTS FC 26»). Сначала точное совпадение, потом полная игра.
+// Если ни одно название не подходит — цены нет, случайную игру не берём
+function matchStoreGame(found: any[], gameName: string) {
+  const name = normalizeGameName(gameName);
+  const words = name.split(" ").filter(Boolean);
+  if (!words.length) return undefined;
+  const fits = found.filter((r) => {
+    const storeWords = new Set(normalizeGameName(r.name).split(" "));
+    return words.every((w) => storeWords.has(w));
+  });
+  return (
+    fits.find((r) => normalizeGameName(r.name) === name) ??
+    fits.find((r) => r.classification === "FULL_GAME") ??
+    fits[0]
+  );
+}
+
+// ---------- Сравнение цен игры по регионам ----------
+
+// Число из цены магазина в любом формате: «1.499,00 TL», «Rs 2,399», «$29.99», «¥4,730», «UAH 1 199,00».
+// Разделитель дробной части — последний «.» или «,», за которым ровно две цифры; остальные — разделители тысяч
+function parseStorePrice(value: string) {
+  const cleaned = value.replace(/[^\d.,]/g, "");
+  if (!cleaned) return null;
+  const match = cleaned.match(/^(.*)[.,](\d{2})$/);
+  const whole = (match ? match[1] : cleaned).replace(/[.,]/g, "");
+  const n = Number(`${whole}.${match ? match[2] : "0"}`);
+  return Number.isFinite(n) ? n : null;
+}
+
+// Курсы ЦБ (рублей за единицу валюты); обновляются раз в сутки — держим в памяти 6 часов
+let cbrRates: { rates: Record<string, number>; at: number } | null = null;
+async function getCbrRates() {
+  if (cbrRates && Date.now() - cbrRates.at < 6 * 60 * 60 * 1000) return cbrRates.rates;
+  const response = await fetch("https://www.cbr-xml-daily.ru/daily_json.js");
+  const body = await response.json();
+  const rates: Record<string, number> = {};
+  for (const [code, v] of Object.entries<any>(body.Valute ?? {})) rates[code] = v.Value / v.Nominal;
+  cbrRates = { rates, at: Date.now() };
+  return rates;
+}
+
+// Цены игры во всех регионах — по каждому изданию (обычное, Deluxe, Ultimate…).
+// Издания находим в турецком магазине: товары, чьё название начинается с названия игры.
+// В остальных регионах то же издание ищем по номеру товара — он одинаковый во всех регионах
+// Слова, из которых состоят названия изданий: «Digital Deluxe Edition», «Cross-Gen Bundle», «PS4 & PS5»
+const EDITION_WORDS = new Set([
+  "digital", "standard", "deluxe", "ultimate", "gold", "premium", "complete", "special", "definitive",
+  "cross", "gen", "launch", "edition", "bundle", "collection", "ps4", "ps5", "&", "and",
+]);
+
+// Название — это та же игра или её издание: совпадает или отличается только словами издания
+// («Minecraft Dungeons II» — не издание «Minecraft Dungeons»)
+function isEditionOf(normalizedName: string, normalizedBase: string) {
+  if (normalizedName === normalizedBase) return true;
+  if (!normalizedName.startsWith(`${normalizedBase} `)) return false;
+  return normalizedName.slice(normalizedBase.length).trim().split(" ").every((w) => EDITION_WORDS.has(w));
+}
+
+// Сама игра для выбранного названия: могли выбрать сразу издание («EA SPORTS FC 27 Ultimate Edition PS4 & PS5»).
+// Отрезаем с конца слова изданий — остаётся «ea sports fc 27». Товара с таким названием в магазине может и не быть
+function baseGameName(selected: string) {
+  const words = normalizeGameName(selected).split(" ").filter(Boolean);
+  while (words.length > 1 && EDITION_WORDS.has(words[words.length - 1])) words.pop();
+  return words.join(" ");
+}
+
+// Подпись издания: «Стандартное» для самой игры, иначе слова издания («Ultimate Edition PS4 & PS5»)
+function editionLabelFor(normalizedName: string, base: string) {
+  if (normalizedName === base) return "Стандартное";
+  return normalizedName
+    .slice(base.length)
+    .trim()
+    .split(" ")
+    .map((w) => (/^ps\d$/.test(w) ? w.toUpperCase() : w.charAt(0).toUpperCase() + w.slice(1)))
+    .join(" ");
+}
+
+async function handlePsRegionPrices(data: any) {
+  const selectedName = str(data.name);
+  if (!selectedName) return json({ success: false, error: "Не указана игра" }, 400);
+  const rates = await getCbrRates().catch(() => ({} as Record<string, number>));
+  const base = baseGameName(selectedName);
+  // Ищем по названию самой игры — так находятся все её издания
+  const name = base;
+
+  const byRegion: Record<string, any[]> = {};
+  await Promise.all(
+    Object.keys(PS_REGIONS).map(async (code) => {
+      byRegion[code] = await psStoreSearch(name, 40, code).catch(() => []);
+    }),
+  );
+
+  const seen = new Set<string>();
+  let editions = (byRegion.tr ?? []).filter((r: any) => {
+    const n = normalizeGameName(r.name);
+    // Бесплатные позиции (например, Friend's Pass) — не издания для продажи
+    if (r.isFree || seen.has(r.id) || !isEditionOf(n, base)) return false;
+    seen.add(r.id);
+    return true;
+  });
+  if (editions.length === 0) {
+    const single = matchStoreGame(byRegion.tr ?? [], name);
+    editions = single ? [single] : [];
+  }
+
+  const result = editions.map((edition: any) => {
+    const prices = Object.entries(PS_REGIONS)
+      .map(([code, region]) => {
+        const hit = (byRegion[code] ?? []).find((r: any) => r.id === edition.id);
+        if (!hit) return null;
+        const amount = hit.isFree ? 0 : parseStorePrice(hit.price);
+        const rate = rates[region.currency];
+        return {
+          code,
+          country: region.name,
+          price: hit.price,
+          basePrice: hit.basePrice && hit.basePrice !== hit.price ? hit.basePrice : null,
+          rub: amount !== null && rate ? Math.round(amount * rate) : null,
+        };
+      })
+      .filter(Boolean)
+      .sort((x: any, y: any) => (x.rub ?? Infinity) - (y.rub ?? Infinity));
+    return {
+      id: edition.id,
+      name: edition.name,
+      label: editionLabelFor(normalizeGameName(edition.name), base),
+      kind: edition.kind,
+      cover: edition.cover,
+      prices,
+    };
+  });
+
+  // Сначала сама игра, дальше издания по цене в Турции
+  result.sort((x: any, y: any) => {
+    const xBase = normalizeGameName(x.name) === base ? 0 : 1;
+    const yBase = normalizeGameName(y.name) === base ? 0 : 1;
+    if (xBase !== yBase) return xBase - yBase;
+    const trX = x.prices.find((p: any) => p.code === "tr")?.rub ?? Infinity;
+    const trY = y.prices.find((p: any) => p.code === "tr")?.rub ?? Infinity;
+    return trX - trY;
+  });
+  return json({ success: true, editions: result.filter((e: any) => e.prices.length > 0) });
+}
+
+// Подсказки при добавлении игры: название, тип, платформы и обложка
+async function handlePsSearch(data: any) {
+  const term = str(data.query);
+  if (term.length < 2) return json({ success: true, results: [] });
+  try {
+    const found = await psStoreSearch(term, 24);
+    // Одна и та же игра встречается отдельно для PS4 и PS5 — объединяем по названию
+    const byName = new Map<string, any>();
+    for (const r of found) {
+      const key = r.name.toLowerCase();
+      const prev = byName.get(key);
+      if (prev) prev.platforms = Array.from(new Set([...prev.platforms, ...r.platforms]));
+      else byName.set(key, { ...r });
+    }
+    return json({ success: true, results: Array.from(byName.values()).slice(0, 10) });
+  } catch (e) {
+    return json({ success: false, error: (e as Error).message }, 502);
   }
 }
 
@@ -149,6 +366,9 @@ async function buildCatalog() {
     const notes = a.slot_notes ?? {};
     accMap[key][ed].push({
       email: (a.login ?? "").trim() || "Без почты",
+      sharedResetAt: a.shared_reset_at ?? null,
+      // Когда аккаунт добавлен (дата покупки, иначе дата создания) — от неё годовой таймер подписок
+      addedAt: a.purchase_date ?? a.created_at ?? null,
       slots: [a.slot1, a.slot2, a.slot3, a.slot4, a.slot5].map((occupied, i) => ({
         isOccupied: toBool(occupied),
         note: notes[String(i + 1)] ?? "",
@@ -1942,6 +2162,44 @@ async function handleUpdateOrderPrice(data: any) {
   return json({ success: true, price });
 }
 
+// Сброс общего доступа — не чаще раза в 6 месяцев
+function addMonthsIso(date: string, months: number) {
+  const d = new Date(`${date}T00:00:00Z`);
+  d.setUTCMonth(d.getUTCMonth() + months);
+  return d.toISOString().slice(0, 10);
+}
+
+// Сброс общего доступа аккаунта: дата (YYYY-MM-DD) или пусто — убрать отметку
+async function handleSetAccountReset(data: any) {
+  const date = str(data.date);
+  if (date && !/^\d{4}-\d{2}-\d{2}$/.test(date)) return json({ success: false, error: "Неверная дата" }, 400);
+
+  const { data: rows, error } = await db
+    .from("accounts")
+    .select("id, shared_reset_at")
+    .eq("game_name", data.gameName)
+    .eq("edition", data.edition)
+    .ilike("login", exactLogin(str(data.login)));
+  if (error) throw error;
+  const account = rows?.[0];
+  if (!account) return json({ success: false, error: "Аккаунт не найден" }, 404);
+
+  // Новый сброс — только через 6 месяцев после прошлого (отметку по ошибке сначала убирают)
+  if (date && account.shared_reset_at) {
+    const nextAllowed = addMonthsIso(account.shared_reset_at, 6);
+    if (date < nextAllowed) {
+      return json({ success: false, error: `Следующий сброс возможен с ${nextAllowed.split("-").reverse().join(".")}` });
+    }
+  }
+
+  const { error: updateError } = await db
+    .from("accounts")
+    .update({ shared_reset_at: date || null })
+    .eq("id", account.id);
+  if (updateError) throw updateError;
+  return json({ success: true, sharedResetAt: date || null });
+}
+
 // Заметка к слоту: пустой текст удаляет заметку
 async function handleUpdateSlotNote(data: any) {
   const slotNumber = Number(data.slotIndex) + 1;
@@ -2769,6 +3027,12 @@ Deno.serve(async (req) => {
           return await handleUpdateOrderPrice(data);
         case "deleteGame":
           return await handleDeleteGame(data);
+        case "psSearch":
+          return await handlePsSearch(data);
+        case "psRegionPrices":
+          return await handlePsRegionPrices(data);
+        case "setAccountReset":
+          return await handleSetAccountReset(data);
         case "avitoChats":
           return await avitoAction(() => handleAvitoChats(data));
         case "avitoMessages":

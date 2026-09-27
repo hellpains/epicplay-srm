@@ -326,6 +326,7 @@ function RateTable({
   apiUrl,
   onSavedPrices,
   onSaved,
+  valuePrefix = "×",
 }: {
   sectionKey: string;
   label: string;
@@ -334,6 +335,7 @@ function RateTable({
   apiUrl: string;
   onSavedPrices: (prices: Record<string, number>) => void;
   onSaved?: () => void;
+  valuePrefix?: string;
 }) {
   const [draft, setDraft] = useState<{ from: string; mult: string }[]>([]);
   const [isEditing, setIsEditing] = useState(false);
@@ -384,8 +386,8 @@ function RateTable({
 
   const cell = "h-11 rounded-xl border flex items-center justify-center text-[14px] tabular-nums";
   const input = `${cell} w-full min-w-0 bg-[#1c1c1e] border-white/15 text-center text-[16px] font-medium text-white outline-none placeholder:text-neutral-600 focus:border-[#12c83b]/50`;
-  const rows: (RateTier | null)[] = [...tiers];
-  while (rows.length < MIN_RATE_COLUMNS) rows.push(null);
+  // В просмотре — только заданные ступени; пустые строки для новых есть в режиме изменения
+  const rows: (RateTier | null)[] = tiers.length ? [...tiers] : [null];
 
   // Ступени идут строками сверху вниз: «от N» | «×K»
   return (
@@ -426,7 +428,7 @@ function RateTable({
                 key={`mult-${i}`}
                 className={`${cell} bg-white/5 border-white/10 ${tier ? "text-[#12c83b] font-bold" : "text-neutral-600"}`}
               >
-                {tier ? `×${formatMult(tier.mult)}` : "—"}
+                {tier ? `${valuePrefix}${formatMult(tier.mult)}` : "—"}
               </div>,
             ])}
       </div>
@@ -472,6 +474,116 @@ function RateTable({
   );
 }
 
+// Регионы PlayStation с курсом — для конвертера в других разделах (например, «Цены»)
+export const PS_RATE_REGIONS = REGIONS.playstation;
+
+// Конвертер валюты региона в ₽ по курсу ступенями; нажатие на флаг открывает таблицу курса.
+// Курс хранится в разделе "<платформа>|<регион>|rate" настроек «Стандарт»; rateKey/rateLabel —
+// свой отдельный курс (например, у раздела «Цены» — "games|ua|rate", независимо от «Стандарта»)
+export function RateConverter({
+  platform = "playstation",
+  platformLabel = "PlayStation",
+  rateKey: rateKeyOverride,
+  rateLabel,
+  usdtRate = null,
+  viaUsdt = false,
+  region,
+  standardPrices,
+  apiUrl,
+  onSaved,
+  amount,
+  onAmountChange,
+  className = "",
+}: {
+  platform?: Platform;
+  platformLabel?: string;
+  rateKey?: string;
+  rateLabel?: string;
+  // Для игр: ₽ = сумма ÷ значение ступени × курс USDT (значение ступени — сколько валюты за 1 USDT).
+  // Без него (подписки) — ₽ = сумма × значение ступени
+  usdtRate?: number | null;
+  viaUsdt?: boolean;
+  region: Region;
+  standardPrices: Record<string, Record<string, number>>;
+  apiUrl: string;
+  onSaved?: () => void;
+  amount: string;
+  onAmountChange: (value: string) => void;
+  className?: string;
+}) {
+  const [showRates, setShowRates] = useState(false);
+  const rateKey = rateKeyOverride ?? `${platform}|${region.id}|rate`;
+  const serverRates = standardPrices[rateKey] ?? DEFAULT_RATE_PRICES;
+  const [ratePrices, setRatePrices] = useState(serverRates);
+  useEffect(() => setRatePrices(serverRates), [serverRates]);
+
+  const tiers = parseRateTiers(ratePrices);
+  const value = Number(amount.replace(",", ".")) || 0;
+  const mult = multiplierFor(tiers, value);
+  const rub = viaUsdt
+    ? usdtRate && mult ? Math.round((value / mult) * usdtRate) : 0
+    : Math.round(value * mult);
+  const canCount = tiers.length > 0 && (!viaUsdt || Boolean(usdtRate));
+
+  return (
+    <div className={`p-2.5 rounded-2xl border border-white/5 bg-neutral-800/40 ${className}`}>
+      <div className="flex items-center gap-3 pr-2.5">
+        <motion.button
+          onTap={() => setShowRates((v) => !v)}
+          whileTap={{ scale: 0.9 }}
+          style={{ WebkitTapHighlightColor: "transparent" }}
+          aria-label="Курс"
+          className={`cursor-pointer touch-manipulation select-none w-11 h-11 shrink-0 rounded-full border flex items-center justify-center transition-colors ${
+            showRates ? "bg-white/10 border-white/20" : "bg-neutral-800 border-transparent"
+          }`}
+        >
+          <region.Flag />
+        </motion.button>
+        <label className="flex-1 min-w-0 h-11 flex items-center gap-2 px-4 rounded-full bg-neutral-800/70">
+          <input
+            type="text"
+            inputMode="decimal"
+            placeholder="0"
+            value={amount}
+            onChange={(e) => onAmountChange(e.target.value.replace(/[^\d.,]/g, ""))}
+            className="flex-1 min-w-0 bg-transparent border-none outline-none text-white text-[16px] placeholder:text-neutral-500"
+          />
+          <span className="text-[13px] font-medium text-neutral-500 shrink-0">{region.currency}</span>
+        </label>
+        <span
+          className="text-[20px] font-bold text-green-500 shrink-0 tabular-nums"
+          title={
+            viaUsdt && !usdtRate
+              ? "Впишите курс USDT"
+              : mult
+              ? viaUsdt
+                ? `Курс: ÷${formatMult(mult)} × USDT ${formatMult(usdtRate ?? 0)}`
+                : `Курс: ×${formatMult(mult)}`
+              : "Курс не задан — нажмите на флаг"
+          }
+        >
+          {canCount ? `${rubFormat.format(rub)}₽` : "—"}
+        </span>
+      </div>
+      {showRates && (
+        <RateTable
+          sectionKey={rateKey}
+          label={rateLabel ?? `Курс · ${platformLabel} · ${region.label}`}
+          currency={region.currency}
+          prices={ratePrices}
+          apiUrl={apiUrl}
+          onSavedPrices={setRatePrices}
+          onSaved={onSaved}
+          valuePrefix={viaUsdt ? "" : "×"}
+        />
+      )}
+      {viaUsdt && !usdtRate && (
+        <div className="mt-2 px-1 text-[12px] text-neutral-500">Впишите курс USDT вверху — по нему считаются рубли</div>
+      )}
+    </div>
+  );
+}
+
 // Экран региона: конвертер валюты региона в ₽ (курс ступенями) и разделы подписок
 function RegionView({
   platform,
@@ -492,17 +604,8 @@ function RegionView({
 }) {
   const [amount, setAmount] = useState("");
   const [openSection, setOpenSection] = useState<string | null>(null);
-  const [showRates, setShowRates] = useState(false);
 
   const sectionKey = (id: string) => `${platform}|${region.id}|${id}`;
-  const serverRates = standardPrices[sectionKey("rate")] ?? DEFAULT_RATE_PRICES;
-  const [ratePrices, setRatePrices] = useState(serverRates);
-  useEffect(() => setRatePrices(serverRates), [serverRates]);
-
-  const tiers = parseRateTiers(ratePrices);
-  const value = Number(amount.replace(",", ".")) || 0;
-  const mult = multiplierFor(tiers, value);
-  const rub = Math.round(value * mult);
 
 
   return (
@@ -524,49 +627,17 @@ function RegionView({
         </div>
       </div>
 
-      <div className="p-2.5 mb-4 rounded-2xl border border-white/5 bg-neutral-800/40">
-      <div className="flex items-center gap-3 pr-2.5">
-        <motion.button
-          onTap={() => setShowRates((v) => !v)}
-          whileTap={{ scale: 0.9 }}
-          style={{ WebkitTapHighlightColor: "transparent" }}
-          aria-label="Курс"
-          className={`cursor-pointer touch-manipulation select-none w-11 h-11 shrink-0 rounded-full border flex items-center justify-center transition-colors ${
-            showRates ? "bg-white/10 border-white/20" : "bg-neutral-800 border-transparent"
-          }`}
-        >
-          <region.Flag />
-        </motion.button>
-        <label className="flex-1 min-w-0 h-11 flex items-center gap-2 px-4 rounded-full bg-neutral-800/70">
-          <input
-            type="text"
-            inputMode="decimal"
-            placeholder="0"
-            value={amount}
-            onChange={(e) => setAmount(e.target.value.replace(/[^\d.,]/g, ""))}
-            className="flex-1 min-w-0 bg-transparent border-none outline-none text-white text-[16px] placeholder:text-neutral-500"
-          />
-          <span className="text-[13px] font-medium text-neutral-500 shrink-0">{region.currency}</span>
-        </label>
-        <span
-          className="text-[20px] font-bold text-green-500 shrink-0 tabular-nums"
-          title={mult ? `Курс: ×${formatMult(mult)}` : "Курс не задан — нажмите на флаг"}
-        >
-          {tiers.length ? `${rubFormat.format(rub)}₽` : "—"}
-        </span>
-      </div>
-      {showRates && (
-        <RateTable
-          sectionKey={sectionKey("rate")}
-          label={`Курс · ${platformLabel} · ${region.label}`}
-          currency={region.currency}
-          prices={ratePrices}
-          apiUrl={apiUrl}
-          onSavedPrices={setRatePrices}
-          onSaved={onSaved}
-        />
-      )}
-      </div>
+      <RateConverter
+        platform={platform}
+        platformLabel={platformLabel}
+        region={region}
+        standardPrices={standardPrices}
+        apiUrl={apiUrl}
+        onSaved={onSaved}
+        amount={amount}
+        onAmountChange={setAmount}
+        className="mb-4"
+      />
 
       <div className="flex flex-col gap-4">
         {SECTIONS.map((section) => {

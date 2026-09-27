@@ -25,6 +25,7 @@ import {
   FileText,
   StickyNote,
   Mail,
+  Clock,
 } from "lucide-react";
 import AddGameModal from "./components/AddGameModal";
 import AddOrderModal from "./AddOrderModal";
@@ -171,6 +172,12 @@ export default function CatalogScreen({
   const [noteDraft, setNoteDraft] = useState("");
   const [isSavingNote, setIsSavingNote] = useState(false);
   const [noteError, setNoteError] = useState("");
+  // Окно «Сброс общего доступа» для аккаунта
+  const [resetModal, setResetModal] = useState<{ email: string; sharedResetAt: string | null } | null>(null);
+  const [isSavingReset, setIsSavingReset] = useState(false);
+  const [resetError, setResetError] = useState("");
+  // «Убрать отметку» — сначала переспрашиваем
+  const [confirmRemoveReset, setConfirmRemoveReset] = useState(false);
   // Логин аккаунта, для которого открыто окно добавления заказа
   const [addOrderLogin, setAddOrderLogin] = useState<string | null>(null);
 
@@ -515,6 +522,96 @@ export default function CatalogScreen({
       setIsDeletingGame(false);
       setConfirmDeleteGame(false);
     }
+  };
+
+  const todayIso = () => {
+    const d = new Date();
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+  };
+
+  // Сброс общего доступа — раз в 6 месяцев: с какой даты можно следующий
+  const nextResetDate = (last: string | null) => {
+    if (!last) return null;
+    const d = new Date(`${last}T00:00:00`);
+    d.setMonth(d.getMonth() + 6);
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+  };
+  // Запрет действует, пока не прошло 6 месяцев — тогда стрелка красная
+  const isResetLocked = (last: string | null) => {
+    const next = nextResetDate(last);
+    return Boolean(next && todayIso() < next);
+  };
+  const ruDate = (iso: string) =>
+    new Date(`${iso}T00:00:00`).toLocaleDateString("ru-RU", { day: "numeric", month: "long", year: "numeric" });
+
+  const openResetModal = (account: any) => {
+    // Полгода прошли — окно как будто сброса не было: можно сразу сделать новый
+    const last = account.sharedResetAt ?? null;
+    setResetModal({ email: account.email, sharedResetAt: isResetLocked(last) ? last : null });
+    setConfirmRemoveReset(false);
+    setResetError("");
+  };
+
+  const handleSaveReset = async (date: string) => {
+    if (!resetModal || !selectedItem || isSavingReset) return;
+    setIsSavingReset(true);
+    setResetError("");
+    try {
+      const response = await apiFetch(API_URL, {
+        method: "POST",
+        body: JSON.stringify({
+          action: "setAccountReset",
+          gameName: selectedItem.name,
+          edition: activeEditionTab,
+          login: resetModal.email,
+          date,
+        }),
+      });
+      const result = await response.json().catch(() => ({}));
+      if (!response.ok || !result.success) throw new Error(result.error || "Не удалось сохранить");
+
+      // Сразу показываем отметку на стрелке, не дожидаясь перезагрузки каталога
+      setSelectedItem((prev: any) => {
+        if (!prev?.accountDetails?.[activeEditionTab]) return prev;
+        const accounts = prev.accountDetails[activeEditionTab].map((acc: any) =>
+          acc.email === resetModal.email ? { ...acc, sharedResetAt: result.sharedResetAt } : acc
+        );
+        return { ...prev, accountDetails: { ...prev.accountDetails, [activeEditionTab]: accounts } };
+      });
+      setResetModal(null);
+      fetchItems(true);
+    } catch (e) {
+      setResetError((e as Error).message);
+    } finally {
+      setIsSavingReset(false);
+    }
+  };
+
+  // Годовой таймер аккаунта подписки: сколько осталось от даты добавления
+  const subscriptionLeft = (addedAt: string | null | undefined) => {
+    if (!addedAt) return null;
+    const start = new Date(addedAt);
+    if (isNaN(start.getTime())) return null;
+    // Считаем по датам, без часов: добавлен сегодня — осталось ровно 12 месяцев
+    start.setHours(0, 0, 0, 0);
+    const end = new Date(start);
+    end.setFullYear(end.getFullYear() + 1);
+    const now = new Date();
+    now.setHours(0, 0, 0, 0);
+    const endLabel = end.toLocaleDateString("ru-RU");
+    if (now > end) return { expired: true, text: `Подписка истекла ${endLabel}` };
+
+    // Полные месяцы до конца, затем оставшиеся дни
+    let months = (end.getFullYear() - now.getFullYear()) * 12 + (end.getMonth() - now.getMonth());
+    const afterMonths = (m: number) => {
+      const d = new Date(now);
+      d.setMonth(d.getMonth() + m);
+      return d;
+    };
+    while (months > 0 && afterMonths(months) > end) months--;
+    const days = Math.floor((end.getTime() - afterMonths(months).getTime()) / 86_400_000);
+    const left = [months ? `${months} мес.` : "", days || !months ? `${days} дн.` : ""].filter(Boolean).join(" ");
+    return { expired: false, text: `Осталось ${left}` };
   };
 
   const fmtMoney = (n: number) =>
@@ -1463,6 +1560,9 @@ export default function CatalogScreen({
                         return filteredAccounts.map(
                           (account: any, accIdx: number) => {
                             const expandKey = `${activeEditionTab}|${account.email}`;
+                            const isSubscription = String(selectedItem.type ?? "").includes("подп");
+                            // У подписок под кнопками ещё строка таймера — нижнее скругление и граница переходят к ней
+                            const buttonsBottom = isSubscription ? "" : "border-b";
                             const isExpanded = expandedAccount === expandKey;
                             return (
                             <Fragment key={accIdx}>
@@ -1562,18 +1662,22 @@ export default function CatalogScreen({
                               ></td>
                             </tr>
                             {isExpanded && (
+                              // Раскрытая часть разбита по колонкам таблицы: слева — логин и первые слоты,
+                              // стрелка и крестик — ровно в колонках двух последних слотов при любой ширине экрана.
+                              // У каждой ячейки свой кусок фона; relative -top-2 — сдвиг на отступ между строками,
+                              // чтобы панель прилегала к строке
                               <tr>
-                                <td colSpan={columnCount} className="p-0">
-                                  {/* Сдвиг вверх на отступ между строками таблицы — панель прилегает к строке.
-                                      w-0 min-w-full — панель занимает ширину таблицы, но не растягивает её */}
-                                  <div className="relative -top-2 w-0 min-w-full px-8 py-3 flex items-center gap-3 bg-white/[0.06] rounded-b-3xl border-x border-b border-white/5">
+                                <td colSpan={columnCount - 3} className="p-0">
+                                  {/* w-0 min-w-full — занимает ширину колонок, но не растягивает таблицу.
+                                      pl-[26px] — кнопки чуть левее почты (у почты отступ 32px), их надписи — чуть правее */}
+                                  <div className={`relative -top-2 w-0 min-w-full h-[60px] pl-[26px] flex items-center gap-2 bg-white/[0.06] border-l border-white/5 ${buttonsBottom} ${isSubscription ? "" : "rounded-bl-3xl"}`}>
                                     <motion.button
                                       whileTap={{ scale: 0.92 }}
                                       onClick={() => setAddOrderLogin(account.email)}
                                       style={{ WebkitTapHighlightColor: "transparent" }}
-                                      className="h-9 px-4 rounded-full border border-[#12c83b]/30 bg-[#12c83b]/15 text-[#12c83b] text-[13px] font-semibold shrink-0 flex items-center gap-1.5"
+                                      className="h-9 px-3 rounded-full border border-[#12c83b]/30 bg-[#12c83b]/15 text-[#12c83b] text-[12px] font-semibold shrink-0 flex items-center gap-1"
                                     >
-                                      <Plus size={15} strokeWidth={2.5} /> Добавить
+                                      <Plus size={14} strokeWidth={2.5} /> Добавить
                                     </motion.button>
                                     <motion.button
                                       whileTap={{ scale: 0.92 }}
@@ -1581,24 +1685,76 @@ export default function CatalogScreen({
                                       aria-label="Информация"
                                       title="Информация"
                                       style={{ WebkitTapHighlightColor: "transparent" }}
-                                      className="h-9 w-9 rounded-full border border-white/10 bg-white/[0.06] text-white shrink-0 flex items-center justify-center"
+                                      className="h-9 px-3 rounded-full border border-white/10 bg-white/[0.06] text-white text-[12px] font-semibold shrink-0 flex items-center gap-1"
                                     >
-                                      <FileText size={17} />
+                                      <FileText size={14} /> Инфо
                                     </motion.button>
+                                  </div>
+                                </td>
+                                <td className="p-0 w-12">
+                                  <div className={`relative -top-2 h-[60px] flex items-center justify-center bg-white/[0.06] border-white/5 ${buttonsBottom}`}>
+                                    {/* Сброс общего доступа; красная обводка — сброс уже был */}
+                                    <motion.button
+                                      whileTap={{ scale: 0.92 }}
+                                      onClick={() => openResetModal(account)}
+                                      aria-label="Сброс общего доступа"
+                                      title="Сброс общего доступа"
+                                      style={{ WebkitTapHighlightColor: "transparent" }}
+                                      className={`h-9 w-9 rounded-full border bg-white/[0.06] shrink-0 flex items-center justify-center ${
+                                        // Красная — сброс сделан и полгода не прошли; зелёная — полгода прошли, сброс снова доступен
+                                        isResetLocked(account.sharedResetAt)
+                                          ? "border-[#ff3b30] text-[#ff3b30] ring-1 ring-[#ff3b30]/40"
+                                          : account.sharedResetAt
+                                          ? "border-[#12c83b] text-[#12c83b] ring-1 ring-[#12c83b]/40"
+                                          : "border-white/10 text-neutral-400"
+                                      }`}
+                                    >
+                                      <RotateCw size={16} />
+                                    </motion.button>
+                                  </div>
+                                </td>
+                                <td className="p-0 w-12">
+                                  <div className={`relative -top-2 h-[60px] flex items-center justify-center bg-white/[0.06] border-white/5 ${buttonsBottom}`}>
                                     <motion.button
                                       whileTap={{ scale: 0.92 }}
                                       onClick={() => setExpandedAccount(null)}
                                       aria-label="Свернуть"
                                       title="Свернуть"
                                       style={{ WebkitTapHighlightColor: "transparent" }}
-                                      className="ml-auto h-9 w-9 rounded-full border border-white/10 bg-white/[0.06] text-neutral-400 shrink-0 flex items-center justify-center"
+                                      className="h-9 w-9 rounded-full border border-white/10 bg-white/[0.06] text-neutral-400 shrink-0 flex items-center justify-center"
                                     >
                                       <X size={17} />
                                     </motion.button>
                                   </div>
                                 </td>
+                                <td className="p-0 w-8">
+                                  <div className={`relative -top-2 h-[60px] bg-white/[0.06] border-r border-white/5 ${buttonsBottom} ${isSubscription ? "" : "rounded-br-3xl"}`} />
+                                </td>
                               </tr>
                             )}
+                            {isExpanded && isSubscription && (() => {
+                              const timer = subscriptionLeft(account.addedAt);
+                              return (
+                                // Под кнопками: сдвиг на два отступа таблицы — вплотную к строке кнопок
+                                <tr>
+                                  <td colSpan={columnCount} className="p-0">
+                                    <div
+                                      className={`relative -top-4 w-0 min-w-full px-8 pb-3 text-[13px] font-medium bg-white/[0.06] rounded-b-3xl border-x border-b border-white/5 ${
+                                        !timer ? "text-neutral-500" : timer.expired ? "text-[#ff3b30]" : "text-[#12c83b]"
+                                      }`}
+                                    >
+                                      {/* Линия отделяет таймер от кнопок */}
+                                      <div className="pt-2.5 border-t border-white/[0.08] flex items-center gap-1.5 min-w-0">
+                                        <Clock size={14} className="shrink-0" />
+                                        <span className="truncate">
+                                          {timer ? timer.text : "Дата добавления аккаунта неизвестна"}
+                                        </span>
+                                      </div>
+                                    </div>
+                                  </td>
+                                </tr>
+                              );
+                            })()}
                             </Fragment>
                             );
                           }
@@ -1926,7 +2082,14 @@ export default function CatalogScreen({
                 </div>
               )}
 
-              <div className="mt-4 min-h-[120px] max-h-[50vh] overflow-y-auto custom-scrollbar pr-1 -mr-1 space-y-2">
+              {!historyModal.isLoading && (
+                <div className="mt-5 pl-1 text-[11px] font-bold uppercase tracking-widest text-neutral-500">
+                  История изменений
+                </div>
+              )}
+              <div
+                className={`${historyModal.isLoading ? "mt-4" : "mt-2"} min-h-[120px] max-h-[50vh] overflow-y-auto custom-scrollbar pr-1 -mr-1 space-y-2`}
+              >
                 {historyModal.isLoading ? (
                   <div className="flex flex-col items-center justify-center h-full py-8 text-neutral-500">
                     <Loader2 size={24} className="animate-spin mb-3 text-blue-500" />
@@ -2235,6 +2398,118 @@ export default function CatalogScreen({
       </AnimatePresence>
 
       <AnimatePresence>
+        {resetModal && (
+          <div
+            key="reset-modal"
+            className="fixed inset-0 z-[300] flex items-center justify-center px-4 bg-black/60 backdrop-blur-md"
+            onClick={(e) => {
+              if (e.target === e.currentTarget && !isSavingReset) setResetModal(null);
+            }}
+          >
+            <motion.div
+              initial={{ opacity: 0, scale: 0.9, y: 15 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.9, y: 15 }}
+              transition={{ type: "spring", damping: 25, stiffness: 350 }}
+              className="relative w-full max-w-[320px] bg-[#1a1a1c] border border-white/10 rounded-[30px] p-6 shadow-2xl flex flex-col"
+            >
+              <button
+                onClick={() => setResetModal(null)}
+                className="absolute top-4 right-4 w-8 h-8 flex items-center justify-center rounded-full bg-white/5 text-neutral-400 active:scale-90 transition-all"
+              >
+                <X size={18} />
+              </button>
+
+              <div className="flex items-center gap-3 mb-5 pr-8">
+                <div
+                  className={`w-10 h-10 rounded-full flex items-center justify-center shrink-0 border ${
+                    resetModal.sharedResetAt
+                      ? "bg-[#ff3b30]/15 border-[#ff3b30]/30 text-[#ff3b30]"
+                      : "bg-white/5 border-white/10 text-neutral-400"
+                  }`}
+                >
+                  <RotateCw size={19} />
+                </div>
+                <div className="flex flex-col items-start min-w-0">
+                  <h3 className="text-lg font-bold text-white tracking-tight leading-none mb-1.5">Сброс общего доступа</h3>
+                  <span className="text-xs text-neutral-400 truncate max-w-[210px] leading-none">{resetModal.email}</span>
+                </div>
+              </div>
+
+              <div
+                className={`rounded-2xl border px-4 py-3 ${
+                  resetModal.sharedResetAt ? "bg-[#ff3b30]/10 border-[#ff3b30]/25" : "bg-white/5 border-white/5"
+                }`}
+              >
+                <div className="text-[12px] text-neutral-400">Последний сброс</div>
+                <div className={`text-[17px] font-bold ${resetModal.sharedResetAt ? "text-[#ff3b30]" : "text-white"}`}>
+                  {resetModal.sharedResetAt ? ruDate(resetModal.sharedResetAt) : "Сброса ещё не было"}
+                </div>
+                {resetModal.sharedResetAt && (
+                  <div className="mt-1 text-[12px] text-neutral-400">
+                    Следующий сброс — с {ruDate(nextResetDate(resetModal.sharedResetAt)!)}
+                  </div>
+                )}
+              </div>
+
+              {resetError && <div className="mt-3 text-[13px] text-red-400">{resetError}</div>}
+              {isResetLocked(resetModal.sharedResetAt) && (
+                <div className="mt-3 text-[12px] text-neutral-500">
+                  Сброс можно делать раз в 6 месяцев. Если отметили по ошибке — уберите отметку.
+                </div>
+              )}
+
+              {confirmRemoveReset ? (
+                <div className="mt-4">
+                  <div className="mb-3 text-center text-[14px] text-white">Точно хотите убрать отметку о сбросе?</div>
+                  <div className="flex gap-2">
+                    <motion.button
+                      whileTap={{ scale: 0.95 }}
+                      onClick={() => setConfirmRemoveReset(false)}
+                      disabled={isSavingReset}
+                      style={{ WebkitTapHighlightColor: "transparent" }}
+                      className="flex-1 h-12 rounded-full border border-white/10 bg-white/[0.06] text-white text-[14px] disabled:opacity-60"
+                    >
+                      Отмена
+                    </motion.button>
+                    <motion.button
+                      whileTap={{ scale: 0.95 }}
+                      onClick={() => handleSaveReset("")}
+                      disabled={isSavingReset}
+                      style={{ WebkitTapHighlightColor: "transparent" }}
+                      className="flex-1 h-12 rounded-full bg-[#ff3b30] text-white text-[14px] font-semibold disabled:opacity-60"
+                    >
+                      {isSavingReset ? "Убираем…" : "Да, убрать"}
+                    </motion.button>
+                  </div>
+                </div>
+              ) : (
+              <div className="mt-4 flex gap-2">
+                {resetModal.sharedResetAt && (
+                  <motion.button
+                    whileTap={{ scale: 0.95 }}
+                    onClick={() => setConfirmRemoveReset(true)}
+                    disabled={isSavingReset}
+                    style={{ WebkitTapHighlightColor: "transparent" }}
+                    className="flex-1 h-12 rounded-full border border-white/10 bg-white/[0.06] text-neutral-300 text-[14px] disabled:opacity-60"
+                  >
+                    Убрать отметку
+                  </motion.button>
+                )}
+                <motion.button
+                  whileTap={{ scale: 0.95 }}
+                  onClick={() => handleSaveReset(todayIso())}
+                  disabled={isSavingReset || isResetLocked(resetModal.sharedResetAt)}
+                  style={{ WebkitTapHighlightColor: "transparent" }}
+                  className="flex-1 h-12 rounded-full bg-[#12c83b] text-black text-[14px] font-semibold disabled:opacity-40"
+                >
+                  {isSavingReset ? "Сохраняем…" : "Сделать сброс"}
+                </motion.button>
+              </div>
+              )}
+            </motion.div>
+          </div>
+        )}
         {noteModal && (
           <div
             key="note-modal"

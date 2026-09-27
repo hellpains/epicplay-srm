@@ -8,5 +8,9 @@ export default defineConfig({
     host: "127.0.0.1",
     port: 5180,
     strictPort: true,
+    watch: {
+      // Аварийный дамп Git Bash: пока он пишется, Windows держит файл занятым, и слежение Vite падает (EBUSY)
+      ignored: ["**/*.stackdump"],
+    },
   },
 });
