@@ -2,6 +2,7 @@ import React, { useState, useRef, useEffect, useMemo } from "react";
 import { apiFetch } from "./config";
 import { motion, AnimatePresence } from "framer-motion";
 import { X, Check, ChevronDown } from "lucide-react";
+import { assignSlotFields, slotNamesFor } from "./slotHistory";
 
 function ResultDialog({
   type,
@@ -72,6 +73,8 @@ export default function AddOrderModal({
   variables = { employees: [], paymentMethods: [], currencies: [] },
   fetchItems,
   API_URL,
+  // Логин для подстановки (открыто из строки аккаунта) — по нему сами подставятся игра и издание
+  initialLogin = "",
 }: any) {
   const EMPLOYEES = variables.employees?.length
     ? variables.employees
@@ -84,12 +87,19 @@ export default function AddOrderModal({
     : ["Валюта"];
 
   const [orderType, setOrderType] = useState("Шеринг");
+  // Вид операции. «Возврат» — без цены и оплаты, в заказ уходит слот «Возврат <слот>»:
+  // сервер по нему освобождает слот и пишет возврат в журнал (как и старый пункт «Возврат» в слотах)
+  const [operation, setOperation] = useState("Продажа");
 
-  const [employee, setEmployee] = useState(
+  const [employee] = useState(
     localStorage.getItem("last_employee") || EMPLOYEES[0]
   );
   const [client, setClient] = useState("");
-  const [login, setLogin] = useState("");
+  const [login, setLogin] = useState(initialLogin);
+  // Замена: аккаунт, который получает клиент (login — аккаунт, который забираем)
+  const [newLogin, setNewLogin] = useState("");
+  const [newSlot, setNewSlot] = useState("");
+  const [showNewLoginSuggestions, setShowNewLoginSuggestions] = useState(false);
 
   const [searchQuery, setSearchQuery] = useState("");
   const [selectedGame, setSelectedGame] = useState<any>(null);
@@ -112,6 +122,11 @@ export default function AddOrderModal({
   const [showZeroPriceModal, setShowZeroPriceModal] = useState(false);
 
   const [errors, setErrors] = useState<Record<string, boolean>>({});
+  // Подсказки для «Клиент» при возврате: кто сейчас занимает слоты этого аккаунта
+  const [slotClients, setSlotClients] = useState<{ client: string; slot: string; field: string; number: number }[]>([]);
+  // Точный слот клиента (slot1..slot5), выбранного из подсказок, — чтобы освободить именно его
+  const [selectedSlotField, setSelectedSlotField] = useState("");
+  const [showClientSuggestions, setShowClientSuggestions] = useState(false);
   const searchContainerRef = useRef<HTMLDivElement>(null);
 
   const [toastStatus, setToastStatus] = useState<null | {
@@ -190,16 +205,124 @@ export default function AddOrderModal({
 
   const availableSlots = useMemo(() => {
     const baseSlots = Array.from(new Set(getSlotsForGame(selectedGame)));
-    if (isAutoFilled && baseSlots.length > 0) {
+    if (isAutoFilled && baseSlots.length > 0 && operation === "Продажа") {
       return [...baseSlots, "Возврат"];
     }
     return baseSlots;
-  }, [selectedGame, isAutoFilled]);
+  }, [selectedGame, isAutoFilled, operation]);
 
   const replacementOptions = useMemo(() => {
     const baseSlots = Array.from(new Set(getSlotsForGame(selectedGame)));
     return baseSlots.map((s) => `Возврат ${s}`);
   }, [selectedGame]);
+
+  // Отметки слотов аккаунта из каталога (true = занят)
+  const occupiedFlags = useMemo(() => {
+    const account = selectedGame?.accountDetails?.[selectedEdition]?.find(
+      (a: any) => a.email?.toLowerCase() === login.trim().toLowerCase()
+    );
+    return (account?.slots ?? []).map((slot: any) => Boolean(slot.isOccupied)) as boolean[];
+  }, [selectedGame, selectedEdition, login]);
+
+  useEffect(() => {
+    if ((operation !== "Возврат" && operation !== "Замена") || !isAutoFilled || !login.trim()) {
+      setSlotClients([]);
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      try {
+        const response = await apiFetch(API_URL, {
+          method: "POST",
+          body: JSON.stringify({ action: "getSlotHistory", login: login.trim() }),
+        });
+        const result = await response.json();
+        if (cancelled || !result.success) return;
+        const hasBoth = Boolean(selectedGame?.hasPS5 && selectedGame?.hasPS4);
+        const names = slotNamesFor(hasBoth);
+        const { occupants } = assignSlotFields(result.history ?? [], hasBoth, occupiedFlags);
+        // Клиенты занятых слотов по порядку; у двух П3 — номер слота
+        const list = names
+          .map((name, i) => {
+            const field = `slot${i + 1}`;
+            const occupant = occupants[field];
+            if (!occupiedFlags[i] || !occupant?.client) return null;
+            const number = names.slice(0, i + 1).filter((n) => n === name).length;
+            return { client: occupant.client, slot: name, field, number: names.filter((n) => n === name).length > 1 ? number : 0 };
+          })
+          .filter(Boolean) as { client: string; slot: string; field: string; number: number }[];
+        setSlotClients(list);
+      } catch {
+        // Без подсказок поле работает как обычно
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [operation, isAutoFilled, login, occupiedFlags]);
+
+  // Замена: аккаунт, который получает клиент, и его свободные слоты (по данным каталога)
+  const newAccount = useMemo(() => {
+    const email = newLogin.trim().toLowerCase();
+    if (!email) return null;
+    for (const game of gamesList) {
+      for (const ed in game.accountDetails ?? {}) {
+        const account = game.accountDetails[ed].find((a: any) => a.email?.toLowerCase() === email);
+        if (account) return { game, edition: ed, account };
+      }
+    }
+    return null;
+  }, [newLogin, gamesList]);
+
+  // Подсказки для «Выдаём аккаунт»: все аккаунты выбранной игры, кроме того, что забираем.
+  // Сначала — со свободными слотами
+  const newLoginSuggestions = useMemo(() => {
+    if (!selectedGame) return [];
+    const oldEmail = login.trim().toLowerCase();
+    const names = getSlotsForGame(selectedGame);
+    const list: { email: string; edition: string; free: number }[] = [];
+    for (const ed in selectedGame.accountDetails ?? {}) {
+      for (const acc of selectedGame.accountDetails[ed]) {
+        if (!acc.email || acc.email.toLowerCase() === oldEmail) continue;
+        const free = names.filter((_: string, i: number) => !acc.slots?.[i]?.isOccupied).length;
+        list.push({ email: acc.email, edition: ed, free });
+      }
+    }
+    const q = newLogin.trim().toLowerCase();
+    const isPicked = list.some((a) => a.email === newLogin);
+    return list
+      .filter((a) => !q || isPicked || a.email.toLowerCase().includes(q))
+      .sort((a, b) => Number(b.free > 0) - Number(a.free > 0));
+  }, [selectedGame, login, newLogin]);
+
+  const isSameAccount = Boolean(newLogin.trim()) && newLogin.trim().toLowerCase() === login.trim().toLowerCase();
+
+  const newSlotOptions = useMemo(() => {
+    if (!newAccount) return [];
+    const names = getSlotsForGame(newAccount.game);
+    const free: Record<string, number> = {};
+    names.forEach((name: string, i: number) => {
+      if (!newAccount.account.slots?.[i]?.isOccupied) free[name] = (free[name] ?? 0) + 1;
+    });
+    return (Array.from(new Set(names)) as string[]).map((name) => ({ name, free: free[name] ?? 0 }));
+  }, [newAccount]);
+
+  // По умолчанию на новом аккаунте — такой же слот, как у клиента был (если свободен)
+  useEffect(() => {
+    if (!newAccount) return setNewSlot("");
+    setNewSlot((current) => {
+      if (newSlotOptions.some((o) => o.name === current && o.free > 0)) return current;
+      const same = newSlotOptions.find((o) => o.name === selectedSlot && o.free > 0);
+      return same ? same.name : "";
+    });
+  }, [newAccount, newSlotOptions, selectedSlot]);
+
+  // Если имя в поле — ровно выбранный клиент со слота, показываем весь список; иначе фильтруем по вводу
+  const filteredSlotClients = useMemo(() => {
+    const q = client.trim().toLowerCase();
+    const isPicked = slotClients.some((c) => c.client === client && c.field === selectedSlotField);
+    return q && !isPicked ? slotClients.filter((c) => c.client.toLowerCase().includes(q)) : slotClients;
+  }, [slotClients, client, selectedSlotField]);
 
   useEffect(() => {
     const searchEmail = login.trim().toLowerCase();
@@ -285,7 +408,8 @@ const handleSubmit = (e?: React.FormEvent) => {
       if (!client.trim()) newErrors.client = true;
       if (!selectedSlot) newErrors.slot = true;
       if (selectedSlot === "Возврат" && !replacementSlot) newErrors.replacementSlot = true;
-      if (!price) newErrors.price = true;
+      // При возврате полей цены и способа оплаты нет
+      if (!price && operation === "Продажа") newErrors.price = true;
     }
 
     if (orderType === "Шеринг аккаунт") {
@@ -294,12 +418,23 @@ const handleSubmit = (e?: React.FormEvent) => {
       if (!isNewLogin && login.trim() !== "") newErrors.duplicateLogin = true; 
     }
 
+    if (orderType === "Шеринг" && operation === "Замена") {
+      if (!newAccount || isSameAccount) newErrors.newLogin = true;
+      if (!newSlot) newErrors.newSlot = true;
+    }
+
     if (Object.keys(newErrors).length > 0) {
       setErrors(newErrors);
       return; 
     }
 
-    if (orderType === "Шеринг" && Number(price) === 0 && price.trim() !== "") {
+
+    if (orderType === "Шеринг" && operation === "Замена") {
+      proceedReplacement();
+      return;
+    }
+
+    if (orderType === "Шеринг" && operation !== "Возврат" && Number(price) === 0 && price.trim() !== "") {
       setShowZeroPriceModal(true);
       return;
     }
@@ -307,12 +442,86 @@ const handleSubmit = (e?: React.FormEvent) => {
     proceedSubmit();
   };
 
+  // Замена = возврат на старом аккаунте (слот освобождается) + продажа на новом (слот занимается).
+  // Цена — необязательная доплата клиента (например, при переходе с П2 на П3).
+  const proceedReplacement = async () => {
+    if (!newAccount) return;
+    setIsSubmitting(true);
+    const send = async (payload: Record<string, unknown>) => {
+      const response = await apiFetch(API_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "addOrder", employee, manualDate: useManualDate ? manualDate : "", ...payload }),
+      });
+      const result = await response.json().catch(() => ({}));
+      if (!response.ok || !result.success) throw new Error(result.error || `сервер ответил ${response.status}`);
+    };
+
+    let oldFreed = false;
+    try {
+      await send({
+        login: login.trim(),
+        gameName: selectedGame.name,
+        edition: selectedEdition,
+        client: client.trim(),
+        slot: `Возврат ${selectedSlot}`,
+        slotField: selectedSlotField,
+        price: "",
+        paymentMethod: "",
+      });
+      oldFreed = true;
+      await send({
+        login: newAccount.account.email,
+        gameName: newAccount.game.name,
+        edition: newAccount.edition,
+        client: client.trim(),
+        slot: newSlot,
+        price: price.trim(),
+        paymentMethod: price.trim() ? paymentMethod : "",
+      });
+
+      setToastStatus({
+        type: "success",
+        message: "замена оформлена",
+        onOk: () => {
+          setToastStatus(null);
+          onClose();
+          if (fetchItems) {
+            fetchItems(true);
+            setTimeout(() => fetchItems(true), 2500);
+          }
+        },
+      });
+    } catch (e) {
+      setToastStatus({
+        type: "error",
+        message: oldFreed
+          ? "слот на старом аккаунте освобождён, а на новом занять не удалось — проверьте новый аккаунт"
+          : `замена не оформлена: ${(e as Error).message}`,
+        onOk: () => {
+          setToastStatus(null);
+          setIsSubmitting(false);
+          if (oldFreed && fetchItems) fetchItems(true);
+        },
+      });
+    }
+  };
+
   const proceedSubmit = async () => {
     setIsSubmitting(true);
     setShowZeroPriceModal(false);
 
-    const finalSlot = selectedSlot === "Возврат" ? replacementSlot : selectedSlot;
-    const finalPrice = selectedSlot === "Возврат" ? `-${price.replace("-", "")}` : price;
+    const isReturnOperation = orderType === "Шеринг" && operation === "Возврат";
+    const finalSlot = isReturnOperation
+      ? `Возврат ${selectedSlot}`
+      : selectedSlot === "Возврат"
+      ? replacementSlot
+      : selectedSlot;
+    const finalPrice = isReturnOperation
+      ? ""
+      : selectedSlot === "Возврат"
+      ? `-${price.replace("-", "")}`
+      : price;
 
     try {
       const requestPayload: any = {
@@ -331,7 +540,8 @@ const handleSubmit = (e?: React.FormEvent) => {
         requestPayload.client = client.trim();
         requestPayload.slot = finalSlot;
         requestPayload.price = finalPrice;
-        requestPayload.paymentMethod = selectedSlot === "Возврат" ? "" : paymentMethod;
+        requestPayload.paymentMethod = isReturnOperation || selectedSlot === "Возврат" ? "" : paymentMethod;
+        if (isReturnOperation && selectedSlotField) requestPayload.slotField = selectedSlotField;
         requestPayload.expense = isNewLogin && expenseValue ? expenseValue : "";
         requestPayload.currency = isNewLogin && expenseValue ? currency : "";
       }
@@ -350,7 +560,12 @@ const handleSubmit = (e?: React.FormEvent) => {
 
       setToastStatus({
         type: "success",
-        message: orderType === "Шеринг аккаунт" ? "аккаунт добавлен" : "успешно добавлен",
+        message:
+          orderType === "Шеринг аккаунт"
+            ? "аккаунт добавлен"
+            : isReturnOperation
+            ? "возврат оформлен"
+            : "успешно добавлен",
         onOk: () => {
           setToastStatus(null);
           onClose();
@@ -412,25 +627,29 @@ const handleSubmit = (e?: React.FormEvent) => {
           </div>
         </div>
         
-        <div className="flex items-center gap-2.5">
+        <div className="flex-1 flex justify-center px-2 min-w-0">
           <div className="relative flex items-center bg-[#262626] hover:bg-white/10 transition-colors rounded-full px-3 py-2 border border-white/5 shadow-sm">
             <ChevronDown size={14} strokeWidth={2.5} className="text-neutral-400 mr-1.5" />
-            <span className="text-[13px] font-medium text-white/90 select-none mr-1">
-              {employee}
-            </span>
+            <span className="text-[13px] font-medium text-white/90 select-none mr-1">{operation}</span>
             <select
-              value={employee}
-              onChange={(e) => setEmployee(e.target.value)}
+              value={operation}
+              onChange={(e) => {
+                setOperation(e.target.value);
+                // Старый пункт «Возврат» в слотах в режиме возврата не нужен
+                if (e.target.value !== "Продажа" && selectedSlot === "Возврат") setSelectedSlot("");
+                setErrors({});
+              }}
               className="absolute inset-0 w-full h-full opacity-0 cursor-pointer appearance-none"
             >
-              {EMPLOYEES.map((emp) => (
-                <option key={emp} value={emp}>
-                  {emp}
-                </option>
-              ))}
+              <option value="Продажа">Продажа</option>
+              <option value="Замена">Замена</option>
+              <option value="Возврат">Возврат</option>
             </select>
           </div>
+        </div>
 
+        {/* Выбор сотрудника убран: в заказ уходит последний выбранный (last_employee) */}
+        <div className="flex items-center gap-2.5">
           <button
             onClick={onClose}
             className="w-10 h-10 flex items-center justify-center rounded-full bg-[#262626] text-neutral-400 active:scale-90 transition-all border border-white/5"
@@ -448,26 +667,74 @@ const handleSubmit = (e?: React.FormEvent) => {
               <label className="text-[13px] text-neutral-400 pl-1">
                 👤 Клиент
               </label>
+              <div className="relative">
               <input
                 type="text"
                 value={client}
                 onChange={(e) => {
                   setClient(e.target.value);
                   setErrors((prev) => ({ ...prev, client: false }));
+                  setShowClientSuggestions(true);
                 }}
-                placeholder="Имя или ник"
+                // onClick — чтобы список открывался и при повторном нажатии на уже активное поле
+                onFocus={() => setShowClientSuggestions(true)}
+                onClick={() => setShowClientSuggestions(true)}
+                onBlur={() => setShowClientSuggestions(false)}
+                placeholder={operation !== "Продажа" && slotClients.length > 0 ? "Выберите клиента со слота" : "Имя или ник"}
                 className={`w-full ${getBgClass(client)} border rounded-xl px-4 py-3 text-[14px] text-white outline-none transition-colors placeholder:text-neutral-600 ${
                   errors.client
                     ? "border-red-500 shadow-[0_0_10px_rgba(239,68,68,0.15)]"
                     : "border-white/5 focus:border-green-500/50"
                 }`}
               />
+              {/* Клиенты на слотах при возврате: выпадают по нажатию на поле, после выбора скрываются */}
+              <AnimatePresence>
+                {operation !== "Продажа" && showClientSuggestions && filteredSlotClients.length > 0 && (
+                  <motion.div
+                    initial={{ opacity: 0, y: -5 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    exit={{ opacity: 0, y: -5 }}
+                    className="absolute z-50 top-full left-0 right-0 mt-2 max-h-60 overflow-y-auto bg-[#1c1c1e] border border-white/10 rounded-2xl shadow-[0_12px_40px_rgba(0,0,0,0.6)] custom-scrollbar p-1.5"
+                  >
+                    <div className="px-3 pt-1.5 pb-2 text-[11px] font-bold uppercase tracking-widest text-neutral-500">
+                      Сейчас на слотах
+                    </div>
+                    {filteredSlotClients.map((c, index) => {
+                      const isPicked = client === c.client && selectedSlotField === c.field;
+                      return (
+                        <div
+                          key={index}
+                          // onMouseDown — срабатывает раньше, чем поле потеряет фокус
+                          onMouseDown={(e) => {
+                            e.preventDefault();
+                            setClient(c.client);
+                            setSelectedSlot(c.slot);
+                            setSelectedSlotField(c.field);
+                            setErrors((prev) => ({ ...prev, client: false, slot: false }));
+                            setShowClientSuggestions(false);
+                          }}
+                          className={`px-3 py-2.5 flex items-center justify-between gap-3 rounded-xl text-[14px] cursor-pointer transition-colors ${
+                            isPicked ? "bg-[#ff3b30]/10 text-white" : "text-neutral-200 hover:bg-white/5 active:bg-white/10"
+                          }`}
+                        >
+                          <span className="truncate">{c.client}</span>
+                          <span className="shrink-0 px-2.5 py-1 rounded-full bg-[#12c83b]/15 text-[13px] font-semibold text-[#12c83b]">
+                            {c.slot}
+                            {c.number ? ` · ${c.number}` : ""}
+                          </span>
+                        </div>
+                      );
+                    })}
+                  </motion.div>
+                )}
+              </AnimatePresence>
+              </div>
             </div>
           )}
 
           <div className="space-y-1.5">
             <label className="text-[13px] text-neutral-400 pl-1">
-              ✉️ Логин
+              {orderType === "Шеринг" && operation === "Замена" ? "📤 Забираем аккаунт" : "✉️ Логин"}
             </label>
             <input
               type="text"
@@ -484,6 +751,111 @@ const handleSubmit = (e?: React.FormEvent) => {
               }`}
             />
           </div>
+
+          {orderType === "Шеринг" && operation === "Замена" && (
+            <div className="space-y-1.5">
+              <label className="text-[13px] text-neutral-400 pl-1">📥 Выдаём аккаунт</label>
+              <div className="relative">
+              <input
+                type="text"
+                value={newLogin}
+                onChange={(e) => {
+                  setNewLogin(e.target.value);
+                  setErrors((prev) => ({ ...prev, newLogin: false }));
+                  setShowNewLoginSuggestions(true);
+                }}
+                onFocus={() => setShowNewLoginSuggestions(true)}
+                onClick={() => setShowNewLoginSuggestions(true)}
+                onBlur={() => setShowNewLoginSuggestions(false)}
+                placeholder="Аккаунт, который получает клиент"
+                className={`w-full ${getBgClass(newLogin)} border rounded-xl px-4 py-3 text-[14px] text-white outline-none transition-colors placeholder:text-neutral-600 ${
+                  errors.newLogin
+                    ? "border-red-500 shadow-[0_0_10px_rgba(239,68,68,0.15)]"
+                    : "border-white/5 focus:border-[#0a84ff]/50"
+                }`}
+              />
+              <AnimatePresence>
+                {showNewLoginSuggestions && newLoginSuggestions.length > 0 && (
+                  <motion.div
+                    initial={{ opacity: 0, y: -5 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    exit={{ opacity: 0, y: -5 }}
+                    className="absolute z-50 top-full left-0 right-0 mt-2 max-h-60 overflow-y-auto bg-[#1c1c1e] border border-white/10 rounded-2xl shadow-[0_12px_40px_rgba(0,0,0,0.6)] custom-scrollbar p-1.5"
+                  >
+                    <div className="px-3 pt-1.5 pb-2 text-[11px] font-bold uppercase tracking-widest text-neutral-500">
+                      Аккаунты · {selectedGame?.name}
+                    </div>
+                    {newLoginSuggestions.map((a) => (
+                      <div
+                        key={a.email}
+                        // onMouseDown — срабатывает раньше, чем поле потеряет фокус
+                        onMouseDown={(e) => {
+                          e.preventDefault();
+                          setNewLogin(a.email);
+                          setErrors((prev) => ({ ...prev, newLogin: false }));
+                          setShowNewLoginSuggestions(false);
+                        }}
+                        className={`px-3 py-2.5 flex items-center justify-between gap-3 rounded-xl text-[14px] cursor-pointer transition-colors hover:bg-white/5 active:bg-white/10 ${
+                          a.email === newLogin ? "bg-[#0a84ff]/10" : ""
+                        } ${a.free > 0 ? "text-neutral-200" : "text-neutral-600"}`}
+                      >
+                        <div className="min-w-0">
+                          <div className="truncate">{a.email}</div>
+                          <div className="text-[11px] text-neutral-500">{a.edition}</div>
+                        </div>
+                        <span
+                          className={`shrink-0 px-2.5 py-1 rounded-full text-[12px] font-semibold ${
+                            a.free > 0 ? "bg-[#12c83b]/15 text-[#12c83b]" : "bg-white/[0.06] text-neutral-500"
+                          }`}
+                        >
+                          {a.free > 0 ? `свободно ${a.free}` : "занят"}
+                        </span>
+                      </div>
+                    ))}
+                  </motion.div>
+                )}
+              </AnimatePresence>
+              </div>
+              {newLogin.trim() && !newAccount && (
+                <div className="pl-1 text-[12px] text-red-400">Аккаунт с такой почтой не найден</div>
+              )}
+              {isSameAccount && (
+                <div className="pl-1 text-[12px] text-red-400">Это тот же аккаунт, который забираем</div>
+              )}
+              {newAccount && !isSameAccount && (
+                <div className="pl-1 text-[12px] text-neutral-500">
+                  {newAccount.game.name} · {newAccount.edition}
+                </div>
+              )}
+            </div>
+          )}
+
+          {orderType === "Шеринг" && operation === "Замена" && newAccount && (
+            <div className="space-y-1.5">
+              <label className="text-[13px] text-neutral-400 pl-1">Слот на новом аккаунте</label>
+              <select
+                value={newSlot}
+                onChange={(e) => {
+                  setNewSlot(e.target.value);
+                  setErrors((prev) => ({ ...prev, newSlot: false }));
+                }}
+                className={`w-full ${getBgClass(newSlot)} border rounded-xl px-4 py-3 text-[14px] text-white outline-none transition-colors appearance-none ${
+                  errors.newSlot
+                    ? "border-red-500 shadow-[0_0_10px_rgba(239,68,68,0.15)]"
+                    : "border-white/5 focus:border-[#0a84ff]/50"
+                }`}
+              >
+                <option value="" disabled>
+                  Выберите слот
+                </option>
+                {newSlotOptions.map((o) => (
+                  <option key={o.name} value={o.name} disabled={o.free === 0}>
+                    {o.name} {o.free === 0 ? "— занят" : `— свободно ${o.free}`}
+                  </option>
+                ))}
+              </select>
+            </div>
+          )}
 
           <div className="space-y-1.5 relative" ref={searchContainerRef}>
             <label className="text-[13px] text-neutral-400 pl-1 flex justify-between items-center">
@@ -592,6 +964,7 @@ const handleSubmit = (e?: React.FormEvent) => {
                     value={selectedSlot}
                     onChange={(e) => {
                       setSelectedSlot(e.target.value);
+                      setSelectedSlotField("");
                       setErrors((prev) => ({ ...prev, slot: false }));
                       if (
                         e.target.value === "Возврат" &&
@@ -667,7 +1040,7 @@ const handleSubmit = (e?: React.FormEvent) => {
             )}
           </AnimatePresence>
 
-          {orderType === "Шеринг" && (
+          {orderType === "Шеринг" && operation !== "Возврат" && (
             <div
               className={`grid gap-3 ${
                 selectedSlot === "Возврат" ? "grid-cols-1" : "grid-cols-[3fr_2fr]"
@@ -694,6 +1067,8 @@ const handleSubmit = (e?: React.FormEvent) => {
                     placeholder={
                       selectedSlot === "Возврат"
                         ? "Размер скидки на след. заказ"
+                        : operation === "Замена"
+                        ? "Необязательно"
                         : "Оплата от клиента"
                     }
                     className={`w-full ${getBgClass(price)} border rounded-xl ${
@@ -828,13 +1203,23 @@ const handleSubmit = (e?: React.FormEvent) => {
             type="button"
             onClick={handleSubmit}
             disabled={isSubmitting}
-            className="w-full py-4 bg-[#12c83b] text-black text-[18px] font-bold rounded-[22px] active:scale-95 transition-all disabled:opacity-50 shadow-[0_10px_30px_rgba(0,0,0,0.5),0_0_20px_rgba(18,200,59,0.2)]"
+            className={`w-full py-4 text-[18px] font-bold rounded-[22px] active:scale-95 transition-all disabled:opacity-50 ${
+              orderType === "Шеринг" && operation === "Возврат"
+                ? "bg-[#ff3b30] text-white shadow-[0_10px_30px_rgba(0,0,0,0.5),0_0_20px_rgba(255,59,48,0.25)]"
+                : orderType === "Шеринг" && operation === "Замена"
+                ? "bg-[#0a84ff] text-white shadow-[0_10px_30px_rgba(0,0,0,0.5),0_0_20px_rgba(10,132,255,0.25)]"
+                : "bg-[#12c83b] text-black shadow-[0_10px_30px_rgba(0,0,0,0.5),0_0_20px_rgba(18,200,59,0.2)]"
+            }`}
           >
             {isSubmitting 
               ? "Отправка..." 
               : orderType === "Шеринг аккаунт" 
                 ? "Добавить аккаунт" 
-                : "Добавить заказ"}
+                : operation === "Возврат"
+                  ? "Сделать возврат"
+                  : operation === "Замена"
+                    ? "Сделать замену"
+                    : "Добавить заказ"}
           </button>
         </div>
       </div>

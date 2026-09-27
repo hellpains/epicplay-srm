@@ -149,9 +149,10 @@ export default function AddGameModal({
     setIsSubmitting(true);
 
     try {
-      await apiFetch(API_URL, {
+      // Без no-cors: в этом режиме браузер вырезает заголовок входа (x-app-token),
+      // сервер отклоняет запрос, а ответ не прочитать — игра не сохранялась молча
+      const response = await apiFetch(API_URL, {
         method: "POST",
-        mode: "no-cors",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           action: "addGame",
@@ -162,8 +163,10 @@ export default function AddGameModal({
           hasPS4: platforms.ps4,
         }),
       });
-
-
+      const result = await response.json().catch(() => ({}));
+      if (!response.ok || !result.success) {
+        throw new Error(result.error || `сервер ответил ${response.status}`);
+      }
 
       setToastStatus({
         type: "success",

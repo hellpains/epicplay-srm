@@ -487,7 +487,7 @@ export default function EmptyAccountsScreen({
                   disabled={isSubmitting || !newEmail.trim()}
                   className="flex-1 py-3.5 bg-[#12c83b] text-black font-semibold rounded-xl active:scale-95 transition-all disabled:opacity-50 text-[15px]"
                 >
-                  {isSubmitting ? "..." : "Добавить"}
+                  {isSubmitting ? "Добавляется..." : "Добавить"}
                 </button>
               </div>
             </motion.div>

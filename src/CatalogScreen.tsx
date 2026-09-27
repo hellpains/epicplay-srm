@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, useMemo } from "react";
+import { Fragment, useState, useRef, useEffect, useMemo } from "react";
 import { apiFetch } from "./config";
 import { motion, AnimatePresence } from "framer-motion";
 import {
@@ -22,8 +22,13 @@ import {
   Trash2,
   Hand,
   QrCode,
+  FileText,
+  StickyNote,
+  Mail,
 } from "lucide-react";
 import AddGameModal from "./components/AddGameModal";
+import AddOrderModal from "./AddOrderModal";
+import { assignSlotFields, slotNamesFor, type SlotOccupant } from "./slotHistory";
 import PriceTable from "./components/PriceTable";
 import StandardPrices from "./components/StandardPrices";
 import { MyLogo } from "./components/MyLogo";
@@ -113,6 +118,10 @@ export default function CatalogScreen({
   const [isSubmittingEdition, setIsSubmittingEdition] = useState(false);
 
   const [showSettingsModal, setShowSettingsModal] = useState(false);
+  // Удаление игры из настроек: первое нажатие — подтверждение, второе — удаление
+  const [confirmDeleteGame, setConfirmDeleteGame] = useState(false);
+  const [isDeletingGame, setIsDeletingGame] = useState(false);
+  const [deleteGameError, setDeleteGameError] = useState("");
   const [settingsName, setSettingsName] = useState("");
   const [settingsCover, setSettingsCover] = useState("");
   const [settingsEditions, setSettingsEditions] = useState<string[]>([]);
@@ -135,8 +144,35 @@ export default function CatalogScreen({
     isOccupied: boolean;
     history: any[];
     isLoading: boolean;
+    // Кто сейчас на этом слоте (по истории заказов) — для карточки над историей
+    occupant: SlotOccupant | null;
   } | null>(null);
   const [isTogglingSlot, setIsTogglingSlot] = useState(false);
+  // Изменение цены заказа текущего клиента в окне истории слота
+  const [editingOrderPrice, setEditingOrderPrice] = useState(false);
+  const [orderPriceDraft, setOrderPriceDraft] = useState("");
+  const [isSavingOrderPrice, setIsSavingOrderPrice] = useState(false);
+  // Удаление аккаунта из окна «Аккаунт»: первое нажатие спрашивает подтверждение
+  const [confirmDeleteAccount, setConfirmDeleteAccount] = useState(false);
+  const [isDeletingAccount, setIsDeletingAccount] = useState(false);
+  const [deleteAccountError, setDeleteAccountError] = useState("");
+  // Сколько заказов на аккаунте (null — ещё считаем). С заказами удалять нельзя — кнопка неактивна
+  const [accountOrdersCount, setAccountOrdersCount] = useState<number | null>(null);
+  const ordersCountLoginRef = useRef("");
+  // Раскрытая строка аккаунта в таблице слотов: "издание|логин" и выбранный в ней слот (для заметки)
+  const [expandedAccount, setExpandedAccount] = useState<string | null>(null);
+  // Открытое окно заметки к слоту
+  const [noteModal, setNoteModal] = useState<{
+    email: string;
+    slotIndex: number;
+    slotName: string;
+    savedNote: string;
+  } | null>(null);
+  const [noteDraft, setNoteDraft] = useState("");
+  const [isSavingNote, setIsSavingNote] = useState(false);
+  const [noteError, setNoteError] = useState("");
+  // Логин аккаунта, для которого открыто окно добавления заказа
+  const [addOrderLogin, setAddOrderLogin] = useState<string | null>(null);
 
   const [accountModal, setAccountModal] = useState<{
     login: string;
@@ -150,6 +186,11 @@ export default function CatalogScreen({
   } | null>(null);
   const [editingSpent, setEditingSpent] = useState(false);
   const [spentDraft, setSpentDraft] = useState("");
+  // Редактирование почты аккаунта в окне «Аккаунт»
+  const [editingLogin, setEditingLogin] = useState(false);
+  const [loginDraft, setLoginDraft] = useState("");
+  const [isSavingLogin, setIsSavingLogin] = useState(false);
+  const [loginError, setLoginError] = useState("");
   const [isSavingSpent, setIsSavingSpent] = useState(false);
 
   const [toastStatus, setToastStatus] = useState<null | {
@@ -227,6 +268,7 @@ export default function CatalogScreen({
     slotIndex: number,
     isOccupied: boolean
   ) => {
+    setEditingOrderPrice(false);
     setHistoryModal({
       isOpen: true,
       login,
@@ -235,6 +277,7 @@ export default function CatalogScreen({
       isOccupied,
       history: [],
       isLoading: true,
+      occupant: null,
     });
 
     try {
@@ -245,22 +288,53 @@ export default function CatalogScreen({
       const result = await response.json();
       
       if (result.success) {
-        
-        const baseSlot = slotName.trim();
-        const returnSlot = "Возврат " + baseSlot;
-        
-        const filteredHistory = result.history.filter((h: any) => {
-          const s = h.slot.trim();
-          return s === baseSlot || s === returnSlot || s.toLowerCase().includes("возврат " + baseSlot.toLowerCase());
-        });
-        
-        setHistoryModal(prev => prev ? { ...prev, history: filteredHistory, isLoading: false } : null);
+        // Каждый слот отдельно, даже два П3: заказы раскладываются по точным слотам
+        const hasBoth = selectedItem?.hasPS5 !== false && selectedItem?.hasPS4 !== false;
+        const account = selectedItem?.accountDetails?.[activeEditionTab]?.find((a: any) => a.email === login);
+        const flags = (account?.slots ?? []).map((slot: any) => Boolean(slot.isOccupied));
+        const { rows, occupants } = assignSlotFields(result.history, hasBoth, flags);
+        const field = `slot${slotIndex + 1}`;
+        const filteredHistory = rows.filter((row) => row.field === field);
+
+        setHistoryModal(prev =>
+          prev
+            ? { ...prev, history: filteredHistory, isLoading: false, occupant: occupants[field] ?? null }
+            : null
+        );
       } else {
         setHistoryModal(prev => prev ? { ...prev, isLoading: false } : null);
       }
     } catch (e) {
       console.error(e);
       setHistoryModal(prev => prev ? { ...prev, isLoading: false } : null);
+    }
+  };
+
+  const handleSaveOrderPrice = async () => {
+    const orderId = historyModal?.occupant?.orderId;
+    if (!orderId || isSavingOrderPrice) return;
+    setIsSavingOrderPrice(true);
+    try {
+      const response = await apiFetch(API_URL, {
+        method: "POST",
+        body: JSON.stringify({ action: "updateOrderPrice", orderId, price: orderPriceDraft }),
+      });
+      const result = await response.json().catch(() => ({}));
+      if (!response.ok || !result.success) throw new Error(result.error || "Не удалось изменить цену");
+      setHistoryModal((prev) =>
+        prev && prev.occupant
+          ? {
+              ...prev,
+              occupant: { ...prev.occupant, price: result.price },
+              history: prev.history.map((row: any) => (row.id === orderId ? { ...row, price: result.price } : row)),
+            }
+          : prev
+      );
+      setEditingOrderPrice(false);
+    } catch (e) {
+      console.error(e);
+    } finally {
+      setIsSavingOrderPrice(false);
     }
   };
 
@@ -298,7 +372,14 @@ export default function CatalogScreen({
         };
         setHistoryModal((prev) =>
           prev
-            ? { ...prev, isOccupied: newOccupied, history: [...prev.history, manualRecord] }
+            ? {
+                ...prev,
+                isOccupied: newOccupied,
+                history: [...prev.history, manualRecord],
+                occupant: newOccupied
+                  ? { client: "", orderId: null, price: null, field: `slot${prev.slotIndex + 1}` }
+                  : null,
+              }
             : null
         );
         fetchItems(true);
@@ -307,6 +388,131 @@ export default function CatalogScreen({
       console.error(e);
     } finally {
       setIsTogglingSlot(false);
+    }
+  };
+
+  // Нажатие на слот: свёрнутый аккаунт — раскрыть строку; раскрытый — открыть историю слота
+  // (заметка открывается кнопкой из истории)
+  const handleSlotTap = (expandKey: string, email: string, slotIndex: number, slotName: string, isOccupied: boolean) => {
+    if (expandedAccount !== expandKey) {
+      setExpandedAccount(expandKey);
+      return;
+    }
+    handleSlotClick(email, slotName, slotIndex, isOccupied);
+  };
+
+  // Заметка текущего слота из данных каталога
+  const slotNoteOf = (email: string, slotIndex: number) =>
+    selectedItem?.accountDetails?.[activeEditionTab]?.find((acc: any) => acc.email === email)?.slots?.[slotIndex]?.note ?? "";
+
+  const openSlotNote = (email: string, slotIndex: number, slotName: string) => {
+    const note = slotNoteOf(email, slotIndex);
+    setHistoryModal(null);
+    setNoteModal({ email, slotIndex, slotName, savedNote: note });
+    setNoteDraft(note);
+    setNoteError("");
+  };
+
+  const handleSaveSlotNote = async (email: string, slotIndex: number, note: string) => {
+    if (!selectedItem || isSavingNote) return;
+    setIsSavingNote(true);
+    setNoteError("");
+    try {
+      const response = await apiFetch(API_URL, {
+        method: "POST",
+        body: JSON.stringify({
+          action: "updateSlotNote",
+          gameName: selectedItem.name,
+          edition: activeEditionTab,
+          email,
+          slotIndex,
+          note,
+        }),
+      });
+      const result = await response.json();
+      if (!result.success) throw new Error(result.error || "Не удалось сохранить заметку");
+
+      // Сразу показываем заметку на слоте, не дожидаясь перезагрузки каталога
+      setSelectedItem((prev: any) => {
+        if (!prev?.accountDetails?.[activeEditionTab]) return prev;
+        const accounts = prev.accountDetails[activeEditionTab].map((acc: any) =>
+          acc.email === email
+            ? {
+                ...acc,
+                slots: acc.slots.map((slot: any, i: number) =>
+                  i === slotIndex ? { ...slot, note: result.note } : slot
+                ),
+              }
+            : acc
+        );
+        return { ...prev, accountDetails: { ...prev.accountDetails, [activeEditionTab]: accounts } };
+      });
+      setNoteModal(null);
+      fetchItems(true);
+    } catch (e) {
+      setNoteError((e as Error).message);
+    } finally {
+      setIsSavingNote(false);
+    }
+  };
+
+  const handleDeleteAccount = async () => {
+    if (!accountModal || !selectedItem || isDeletingAccount) return;
+    setIsDeletingAccount(true);
+    setDeleteAccountError("");
+    try {
+      const response = await apiFetch(API_URL, {
+        method: "POST",
+        body: JSON.stringify({
+          action: "deleteAccount",
+          gameName: selectedItem.name,
+          edition: activeEditionTab,
+          login: accountModal.login,
+        }),
+      });
+      const result = await response.json().catch(() => ({}));
+      if (!response.ok || !result.success) throw new Error(result.error || "Не удалось удалить аккаунт");
+
+      setAccountModal(null);
+      setExpandedAccount(null);
+      setConfirmDeleteAccount(false);
+      fetchItems(true);
+    } catch (e) {
+      setDeleteAccountError((e as Error).message);
+      setConfirmDeleteAccount(false);
+    } finally {
+      setIsDeletingAccount(false);
+    }
+  };
+
+  // Есть ли у игры аккаунты хотя бы в одном издании — тогда удалять нельзя
+  const gameHasAccounts = Object.values(selectedItem?.accountDetails ?? {}).some(
+    (list: any) => Array.isArray(list) && list.length > 0
+  );
+
+  const handleDeleteGame = async () => {
+    if (!selectedItem || gameHasAccounts || isDeletingGame) return;
+    if (!confirmDeleteGame) {
+      setConfirmDeleteGame(true);
+      return;
+    }
+    setIsDeletingGame(true);
+    setDeleteGameError("");
+    try {
+      const response = await apiFetch(API_URL, {
+        method: "POST",
+        body: JSON.stringify({ action: "deleteGame", id: selectedItem.id }),
+      });
+      const result = await response.json().catch(() => ({}));
+      if (!response.ok || !result.success) throw new Error(result.error || "Не удалось удалить");
+      setShowSettingsModal(false);
+      setSelectedItem(null);
+      fetchItems(true);
+    } catch (e) {
+      setDeleteGameError((e as Error).message);
+    } finally {
+      setIsDeletingGame(false);
+      setConfirmDeleteGame(false);
     }
   };
 
@@ -355,9 +561,70 @@ export default function CatalogScreen({
     }
   };
 
+  const handleSaveLogin = async () => {
+    if (!accountModal || !selectedItem || isSavingLogin) return;
+    const newLogin = loginDraft.trim();
+    if (!newLogin) return setLoginError("Укажите почту");
+    if (newLogin === accountModal.login) return setEditingLogin(false);
+    setIsSavingLogin(true);
+    setLoginError("");
+    try {
+      const response = await apiFetch(API_URL, {
+        method: "POST",
+        body: JSON.stringify({
+          action: "updateAccountLogin",
+          login: accountModal.login,
+          newLogin,
+          gameName: selectedItem.name,
+          edition: activeEditionTab,
+        }),
+      });
+      const result = await response.json().catch(() => ({}));
+      if (!response.ok || !result.success) throw new Error(result.error || "Не удалось изменить почту");
+
+      const oldLogin = accountModal.login;
+      setAccountModal((prev) => (prev ? { ...prev, login: result.login } : prev));
+      ordersCountLoginRef.current = result.login;
+      // Раскрытая строка и подсветка скопированной почты привязаны к почте — переносим на новую
+      setExpandedAccount((key) =>
+        key === `${activeEditionTab}|${oldLogin}` ? `${activeEditionTab}|${result.login}` : key
+      );
+      if (lastCopiedEmail === oldLogin) {
+        setLastCopiedEmail(result.login);
+        localStorage.setItem("lastCopiedEmail", result.login);
+      }
+      setEditingLogin(false);
+      fetchItems(true);
+    } catch (e) {
+      setLoginError((e as Error).message);
+    } finally {
+      setIsSavingLogin(false);
+    }
+  };
+
   const handleAccountClick = async (login: string) => {
     setEditingSpent(false);
+    setEditingLogin(false);
+    setLoginError("");
+    setConfirmDeleteAccount(false);
+    setDeleteAccountError("");
+    setAccountOrdersCount(null);
+    ordersCountLoginRef.current = login;
     setAccountModal({ login, data: null, isLoading: true });
+
+    // Заказы — строки истории без служебного события (ручные «занять/освободить слот» не считаются)
+    apiFetch(API_URL, {
+      method: "POST",
+      body: JSON.stringify({ action: "getSlotHistory", login }),
+    })
+      .then((r) => r.json())
+      .then((result) => {
+        // Ответ по прошлому аккаунту (окно уже открыли для другого) не применяем
+        if (result.success && ordersCountLoginRef.current === login) {
+          setAccountOrdersCount(result.history.filter((h: any) => !h.event).length);
+        }
+      })
+      .catch(() => {});
 
     try {
       const response = await apiFetch(API_URL, {
@@ -448,9 +715,9 @@ export default function CatalogScreen({
     setIsSubmittingEdition(true);
 
     try {
-      await apiFetch(API_URL, {
+      // Без no-cors: иначе браузер вырезает заголовок входа и сервер молча отклоняет запрос
+      const response = await apiFetch(API_URL, {
         method: "POST",
-        mode: "no-cors",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           action: "addEdition",
@@ -459,6 +726,10 @@ export default function CatalogScreen({
           edition: newEditionName.trim(),
         }),
       });
+      const result = await response.json().catch(() => ({}));
+      if (!response.ok || !result.success) {
+        throw new Error(result.error || `сервер ответил ${response.status}`);
+      }
 
       setToastStatus({
         type: "success",
@@ -492,6 +763,8 @@ export default function CatalogScreen({
     );
     setSettingsPS5(selectedItem.hasPS5 !== false);
     setSettingsPS4(selectedItem.hasPS4 !== false);
+    setConfirmDeleteGame(false);
+    setDeleteGameError("");
     setShowSettingsModal(true);
   };
 
@@ -624,9 +897,9 @@ export default function CatalogScreen({
     setIsSubmittingAccount(true);
 
     try {
-      await apiFetch(API_URL, {
+      // Без no-cors: иначе браузер вырезает заголовок входа и сервер молча отклоняет запрос
+      const response = await apiFetch(API_URL, {
         method: "POST",
-        mode: "no-cors",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           action: "addAccount",
@@ -639,6 +912,10 @@ export default function CatalogScreen({
           manualDate: "",
         }),
       });
+      const result = await response.json().catch(() => ({}));
+      if (!response.ok || !result.success) {
+        throw new Error(result.error || `сервер ответил ${response.status}`);
+      }
 
       setToastStatus({
         type: "success",
@@ -1163,7 +1440,7 @@ export default function CatalogScreen({
                           );
                         }
                       })()}
-                      <th className="w-6"></th>
+                      <th className="w-8"></th>
                     </tr>
                   </thead>
                   <tbody>
@@ -1176,22 +1453,36 @@ export default function CatalogScreen({
                               .includes(searchQuery.toLowerCase())
                         ) || [];
                       if (filteredAccounts.length > 0) {
+                        const hasBothPlatforms = selectedItem.hasPS5 !== false && selectedItem.hasPS4 !== false;
+                        // Логин + слоты + пустая колонка справа
+                        const columnCount = 1 + (hasBothPlatforms ? 5 : 3) + 1;
+                        const slotNames = hasBothPlatforms
+                          ? ["PS5 П3", "PS5 П3", "PS5 П2", "PS4 П3", "PS4 П2"]
+                          : ["П3", "П3", "П2"];
                         return filteredAccounts.map(
-                          (account: any, accIdx: number) => (
+                          (account: any, accIdx: number) => {
+                            const expandKey = `${activeEditionTab}|${account.email}`;
+                            const isExpanded = expandedAccount === expandKey;
+                            return (
+                            <Fragment key={accIdx}>
                             <tr
-                              key={accIdx}
-                              className="bg-white/[0.03] shadow-sm backdrop-blur-sm"
+                              className={`shadow-sm backdrop-blur-sm transition-colors ${
+                                isExpanded ? "bg-white/[0.06]" : "bg-white/[0.03]"
+                              }`}
                             >
                               <td
-                                className={`pl-8 py-3 text-[13px] font-medium cursor-pointer select-none touch-manipulation rounded-l-3xl border-l border-y border-white/5 transition-colors ${
+                                className={`pl-8 py-3 text-[13px] font-medium cursor-pointer select-none touch-manipulation border-l border-white/5 transition-colors ${
+                                  isExpanded ? "rounded-tl-3xl border-t" : "rounded-l-3xl border-y"
+                                } ${
                                   lastCopiedEmail === account.email
                                     ? "bg-green-500/10 text-green-400"
                                     : "bg-transparent text-white"
                                 }`}
                                 style={{ WebkitTapHighlightColor: "transparent" }}
-                                onClick={() => handleAccountClick(account.email)}
+                                onClick={() => handleCopy(account.email)}
                               >
                                 <div className="flex items-center h-full">
+                                  {/* Последняя скопированная почта остаётся зелёной, пока не скопируют другую */}
                                   <motion.span
                                     key={
                                       copyStatus === account.email
@@ -1201,13 +1492,13 @@ export default function CatalogScreen({
                                     initial={false}
                                     animate={{
                                       color:
-                                        copyStatus === account.email
+                                        lastCopiedEmail === account.email
                                           ? "#12c83b"
                                           : "#e5e5e5",
                                       scale:
                                         copyStatus === account.email ? 1.05 : 1,
                                       fontWeight:
-                                        copyStatus === account.email
+                                        lastCopiedEmail === account.email
                                           ? 700
                                           : 500,
                                     }}
@@ -1220,26 +1511,32 @@ export default function CatalogScreen({
                               </td>
                               
                               {account.slots?.map((slot: any, i: number) => {
-                                const hasBoth = selectedItem.hasPS5 !== false && selectedItem.hasPS4 !== false;
-                                
-                                if (!hasBoth && i >= 3) return null;
+                                if (!hasBothPlatforms && i >= 3) return null;
 
-                                const slotNamesArray = hasBoth 
-                                  ? ["PS5 П3", "PS5 П3", "PS5 П2", "PS4 П3", "PS4 П2"] 
-                                  : ["П3", "П3", "П2"];
-                                const currentSlotName = slotNamesArray[i];
-
+                                const hasNote = Boolean(slot.note);
+                                const isSelectedSlot =
+                                  isExpanded &&
+                                  ((noteModal?.email === account.email && noteModal.slotIndex === i) ||
+                                    (historyModal?.login === account.email && historyModal.slotIndex === i));
                                 return (
                                   <td
                                     key={i}
-                                    onClick={() => handleSlotClick(account.email, currentSlotName, i, slot.isOccupied)}
-                                    className="py-3 text-center w-12 border-y border-white/5 cursor-pointer active:bg-white/10 transition-colors"
+                                    onClick={() => handleSlotTap(expandKey, account.email, i, slotNames[i], slot.isOccupied)}
+                                    className={`py-3 text-center w-12 border-white/5 cursor-pointer active:bg-white/10 transition-colors ${
+                                      isExpanded ? "border-t" : "border-y"
+                                    }`}
                                   >
                                     <div
-                                      className={`w-7 h-7 rounded-full mx-auto flex items-center justify-center transition-all ${
+                                      className={`relative w-7 h-7 rounded-full mx-auto flex items-center justify-center transition-all ${
                                         slot.isOccupied
                                           ? "bg-[#12c83b] shadow-[0_0_15px_rgba(18,200,59,0.4)]"
                                           : "bg-white/5 border border-white/10"
+                                      } ${
+                                        hasNote
+                                          ? "ring-2 ring-orange-400 ring-offset-2 ring-offset-[#1c1c1c]"
+                                          : isSelectedSlot
+                                          ? "ring-2 ring-white/40 ring-offset-2 ring-offset-[#1c1c1c]"
+                                          : ""
                                       }`}
                                     >
                                       {slot.isOccupied && (
@@ -1249,13 +1546,61 @@ export default function CatalogScreen({
                                           className="text-white"
                                         />
                                       )}
+                                      {/* Пометка: у слота есть заметка */}
+                                      {hasNote && (
+                                        <span className="absolute -top-1.5 -right-1.5 w-3 h-3 rounded-full bg-orange-400 border-2 border-[#1c1c1c]" />
+                                      )}
                                     </div>
                                   </td>
                                 );
                               })}
-                              <td className="w-6 py-3 rounded-r-3xl border-r border-y border-white/5"></td>
+                              <td
+                                className={`w-8 py-3 border-r border-white/5 ${
+                                  isExpanded ? "rounded-tr-3xl border-t" : "rounded-r-3xl border-y"
+                                }`}
+                              ></td>
                             </tr>
-                          )
+                            {isExpanded && (
+                              <tr>
+                                <td colSpan={columnCount} className="p-0">
+                                  {/* Сдвиг вверх на отступ между строками таблицы — панель прилегает к строке.
+                                      w-0 min-w-full — панель занимает ширину таблицы, но не растягивает её */}
+                                  <div className="relative -top-2 w-0 min-w-full px-8 py-3 flex items-center gap-3 bg-white/[0.06] rounded-b-3xl border-x border-b border-white/5">
+                                    <motion.button
+                                      whileTap={{ scale: 0.92 }}
+                                      onClick={() => setAddOrderLogin(account.email)}
+                                      style={{ WebkitTapHighlightColor: "transparent" }}
+                                      className="h-9 px-4 rounded-full border border-[#12c83b]/30 bg-[#12c83b]/15 text-[#12c83b] text-[13px] font-semibold shrink-0 flex items-center gap-1.5"
+                                    >
+                                      <Plus size={15} strokeWidth={2.5} /> Добавить
+                                    </motion.button>
+                                    <motion.button
+                                      whileTap={{ scale: 0.92 }}
+                                      onClick={() => handleAccountClick(account.email)}
+                                      aria-label="Информация"
+                                      title="Информация"
+                                      style={{ WebkitTapHighlightColor: "transparent" }}
+                                      className="h-9 w-9 rounded-full border border-white/10 bg-white/[0.06] text-white shrink-0 flex items-center justify-center"
+                                    >
+                                      <FileText size={17} />
+                                    </motion.button>
+                                    <motion.button
+                                      whileTap={{ scale: 0.92 }}
+                                      onClick={() => setExpandedAccount(null)}
+                                      aria-label="Свернуть"
+                                      title="Свернуть"
+                                      style={{ WebkitTapHighlightColor: "transparent" }}
+                                      className="ml-auto h-9 w-9 rounded-full border border-white/10 bg-white/[0.06] text-neutral-400 shrink-0 flex items-center justify-center"
+                                    >
+                                      <X size={17} />
+                                    </motion.button>
+                                  </div>
+                                </td>
+                              </tr>
+                            )}
+                            </Fragment>
+                            );
+                          }
                         );
                       } else {
                         return (
@@ -1345,7 +1690,7 @@ export default function CatalogScreen({
                   style={{ WebkitTapHighlightColor: "transparent" }}
                   className="cursor-pointer touch-manipulation select-none flex-1 py-3.5 bg-[#12c83b] text-black font-semibold rounded-xl transition-all disabled:opacity-50 text-[15px]"
                 >
-                  {isSubmittingEdition ? "..." : "Добавить"}
+                  {isSubmittingEdition ? "Добавляется..." : "Добавить"}
                 </motion.button>
               </div>
             </motion.div>
@@ -1436,7 +1781,7 @@ export default function CatalogScreen({
                   style={{ WebkitTapHighlightColor: "transparent" }}
                   className="cursor-pointer touch-manipulation select-none flex-1 py-3.5 bg-[#12c83b] text-black font-semibold rounded-xl transition-all disabled:opacity-50 text-[15px]"
                 >
-                  {isSubmittingAccount ? "..." : "Добавить"}
+                  {isSubmittingAccount ? "Добавляется..." : "Добавить"}
                 </motion.button>
               </div>
             </motion.div>
@@ -1468,6 +1813,13 @@ export default function CatalogScreen({
                 <div className="flex flex-col items-start">
                   <h3 className="text-lg font-bold text-white tracking-tight leading-none mb-1.5">
                     История: {historyModal.slotName}
+                    {(() => {
+                      const names = slotNamesFor(selectedItem?.hasPS5 !== false && selectedItem?.hasPS4 !== false);
+                      const same = names.filter((n) => n === historyModal.slotName).length;
+                      if (same < 2) return null;
+                      const number = names.slice(0, historyModal.slotIndex + 1).filter((n) => n === historyModal.slotName).length;
+                      return <span className="text-neutral-500"> · {number}</span>;
+                    })()}
                   </h3>
                   <div
                     className="cursor-pointer py-1 -my-1"
@@ -1492,6 +1844,75 @@ export default function CatalogScreen({
                   </div>
                 </div>
               </div>
+
+              {!historyModal.isLoading && (
+                <div
+                  className={`mt-4 rounded-2xl border px-4 py-3 flex items-center justify-between gap-3 ${
+                    historyModal.isOccupied
+                      ? "bg-[#12c83b]/10 border-[#12c83b]/25"
+                      : "bg-white/5 border-white/5"
+                  }`}
+                >
+                  {historyModal.isOccupied ? (
+                    <>
+                      <div className="min-w-0">
+                        <div className="text-[15px] font-bold text-white truncate">
+                          {historyModal.occupant?.client || "Клиент не указан"}
+                        </div>
+                        <div className="text-[12px] text-[#12c83b]">{historyModal.slotName}</div>
+                      </div>
+                      {historyModal.occupant?.orderId &&
+                        (editingOrderPrice ? (
+                          <div className="flex items-center gap-2 shrink-0">
+                            <input
+                              autoFocus
+                              type="number"
+                              inputMode="decimal"
+                              value={orderPriceDraft}
+                              onChange={(e) => setOrderPriceDraft(e.target.value)}
+                              onKeyDown={(e) => {
+                                if (e.key === "Enter") handleSaveOrderPrice();
+                              }}
+                              placeholder="0"
+                              className="w-20 bg-[#121212] border border-green-500/40 rounded-lg px-2 py-1.5 text-[15px] text-white text-right outline-none [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
+                            />
+                            <button
+                              onClick={handleSaveOrderPrice}
+                              disabled={isSavingOrderPrice}
+                              className="w-8 h-8 flex items-center justify-center rounded-lg bg-[#12c83b] text-black active:scale-90 transition-all disabled:opacity-50 shrink-0"
+                            >
+                              {isSavingOrderPrice ? (
+                                <Loader2 size={16} className="animate-spin" />
+                              ) : (
+                                <Check size={16} strokeWidth={3} />
+                              )}
+                            </button>
+                          </div>
+                        ) : (
+                          <button
+                            onClick={() => {
+                              setOrderPriceDraft(
+                                historyModal.occupant?.price === null || historyModal.occupant?.price === undefined
+                                  ? ""
+                                  : String(historyModal.occupant.price)
+                              );
+                              setEditingOrderPrice(true);
+                            }}
+                            className="flex flex-col items-end shrink-0 active:scale-95 transition-all"
+                          >
+                            <span className="text-[11px] text-neutral-400">Получено</span>
+                            <span className="flex items-center gap-1.5 text-[16px] font-bold text-[#12c83b]">
+                              {fmtMoney(Number(historyModal.occupant.price) || 0)}
+                              <Pencil size={13} className="text-neutral-500" />
+                            </span>
+                          </button>
+                        ))}
+                    </>
+                  ) : (
+                    <div className="text-[14px] text-neutral-400">Слот свободен</div>
+                  )}
+                </div>
+              )}
 
               <div className="mt-4 min-h-[120px] max-h-[50vh] overflow-y-auto custom-scrollbar pr-1 -mr-1 space-y-2">
                 {historyModal.isLoading ? (
@@ -1573,10 +1994,23 @@ export default function CatalogScreen({
                 )}
               </div>
 
+              {(() => {
+                const note = slotNoteOf(historyModal.login, historyModal.slotIndex);
+                return (
+                  <button
+                    onClick={() => openSlotNote(historyModal.login, historyModal.slotIndex, historyModal.slotName)}
+                    className="mt-4 w-full py-3 px-4 rounded-2xl text-[15px] font-semibold active:scale-95 transition-all flex items-center justify-center gap-2 border bg-orange-400/10 text-orange-400 border-orange-400/25"
+                  >
+                    <StickyNote size={16} className="shrink-0" />
+                    <span className="truncate">{note ? `Заметка: ${note}` : "Добавить заметку"}</span>
+                  </button>
+                );
+              })()}
+
               <button
                 onClick={handleToggleSlotState}
                 disabled={isTogglingSlot}
-                className={`mt-4 w-full py-3.5 rounded-2xl font-semibold text-[15px] active:scale-95 transition-all disabled:opacity-50 flex items-center justify-center gap-2 border ${
+                className={`mt-2 w-full py-3.5 rounded-2xl font-semibold text-[15px] active:scale-95 transition-all disabled:opacity-50 flex items-center justify-center gap-2 border ${
                   historyModal.isOccupied
                     ? "bg-red-500/10 text-red-400 border-red-500/20"
                     : "bg-[#12c83b]/10 text-[#12c83b] border-[#12c83b]/25"
@@ -1609,13 +2043,39 @@ export default function CatalogScreen({
                   <Settings size={18} className="text-green-500" />
                   <h2 className="text-[18px] font-medium text-white">Настройки</h2>
                 </div>
-                <button
-                  onClick={() => setShowSettingsModal(false)}
-                  className="w-8 h-8 flex items-center justify-center rounded-full bg-white/5 text-neutral-400 active:scale-90 transition-all"
-                >
-                  <X size={18} />
-                </button>
+                <div className="flex items-center gap-2">
+                  <button
+                    onClick={handleDeleteGame}
+                    disabled={gameHasAccounts || isDeletingGame}
+                    title={gameHasAccounts ? "Нельзя удалить: у игры есть аккаунты" : "Удалить"}
+                    className={`h-8 flex items-center justify-center gap-1.5 rounded-full bg-[#ff3b30]/10 border border-[#ff3b30]/25 text-[#ff3b30] active:scale-90 transition-all disabled:opacity-30 disabled:active:scale-100 ${
+                      confirmDeleteGame ? "px-3 text-[13px] font-semibold" : "w-8"
+                    }`}
+                  >
+                    {isDeletingGame ? (
+                      <Loader2 size={15} className="animate-spin" />
+                    ) : (
+                      <>
+                        <Trash2 size={15} />
+                        {confirmDeleteGame && "Удалить?"}
+                      </>
+                    )}
+                  </button>
+                  <button
+                    onClick={() => setShowSettingsModal(false)}
+                    className="w-8 h-8 flex items-center justify-center rounded-full bg-white/5 text-neutral-400 active:scale-90 transition-all"
+                  >
+                    <X size={18} />
+                  </button>
+                </div>
               </div>
+              {(gameHasAccounts || deleteGameError) && (
+                <div
+                  className={`px-6 pt-3 text-[12px] ${deleteGameError ? "text-red-400" : "text-neutral-500"}`}
+                >
+                  {deleteGameError || "Удалить нельзя: у игры есть аккаунты"}
+                </div>
+              )}
 
               <div className="p-6 space-y-5 overflow-y-auto custom-scrollbar">
                 <div className="space-y-1.5">
@@ -1752,6 +2212,77 @@ export default function CatalogScreen({
       </AnimatePresence>
 
       <AnimatePresence>
+        {noteModal && (
+          <div
+            key="note-modal"
+            className="fixed inset-0 z-[300] flex items-center justify-center px-4 bg-black/60 backdrop-blur-md"
+            onClick={(e) => {
+              if (e.target === e.currentTarget && !isSavingNote) setNoteModal(null);
+            }}
+          >
+            <motion.div
+              initial={{ opacity: 0, scale: 0.9, y: 15 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.9, y: 15 }}
+              transition={{ type: "spring", damping: 25, stiffness: 350 }}
+              className="relative w-full max-w-[320px] bg-[#1a1a1c] border border-white/10 rounded-[30px] p-6 shadow-2xl flex flex-col"
+            >
+              <button
+                onClick={() => setNoteModal(null)}
+                className="absolute top-4 right-4 w-8 h-8 flex items-center justify-center rounded-full bg-white/5 text-neutral-400 active:scale-90 transition-all"
+              >
+                <X size={18} />
+              </button>
+
+              <div className="flex items-center gap-3 mb-5 pr-8">
+                <div className="w-10 h-10 rounded-full bg-orange-400/20 flex items-center justify-center shrink-0 border border-orange-400/30">
+                  <StickyNote size={20} className="text-orange-400" />
+                </div>
+                <div className="flex flex-col items-start min-w-0">
+                  <h3 className="text-lg font-bold text-white tracking-tight leading-none mb-1.5">
+                    Заметка · {noteModal.slotName}
+                  </h3>
+                  <span className="text-xs text-neutral-400 truncate max-w-[210px] leading-none">
+                    {noteModal.email}
+                  </span>
+                </div>
+              </div>
+
+              <textarea
+                autoFocus
+                value={noteDraft}
+                onChange={(e) => setNoteDraft(e.target.value)}
+                placeholder="Например: клиент продлит 01.10"
+                rows={4}
+                className="w-full resize-none bg-white/[0.04] border border-white/10 rounded-[18px] px-4 py-3 text-[15px] text-white outline-none focus:border-orange-400/50 placeholder:text-neutral-600"
+              />
+              {noteError && <div className="mt-2 text-[13px] text-red-400">{noteError}</div>}
+
+              <div className="mt-4 flex gap-2">
+                {noteModal.savedNote && (
+                  <motion.button
+                    whileTap={{ scale: 0.95 }}
+                    onClick={() => handleSaveSlotNote(noteModal.email, noteModal.slotIndex, "")}
+                    disabled={isSavingNote}
+                    style={{ WebkitTapHighlightColor: "transparent" }}
+                    className="flex-1 h-12 rounded-full border border-white/10 bg-white/[0.06] text-neutral-300 text-[15px] disabled:opacity-60"
+                  >
+                    Удалить
+                  </motion.button>
+                )}
+                <motion.button
+                  whileTap={{ scale: 0.95 }}
+                  onClick={() => handleSaveSlotNote(noteModal.email, noteModal.slotIndex, noteDraft)}
+                  disabled={isSavingNote || noteDraft.trim() === noteModal.savedNote}
+                  style={{ WebkitTapHighlightColor: "transparent" }}
+                  className="flex-1 h-12 rounded-full bg-orange-400 text-black text-[15px] font-semibold disabled:opacity-40"
+                >
+                  {isSavingNote ? "Сохраняем…" : "Сохранить"}
+                </motion.button>
+              </div>
+            </motion.div>
+          </div>
+        )}
         {accountModal && (
           <div className="fixed inset-0 z-[300] flex items-center justify-center px-4 bg-black/60 backdrop-blur-md">
             <motion.div
@@ -1812,6 +2343,55 @@ export default function CatalogScreen({
                 <div className="space-y-2.5">
                   <div className="flex items-center justify-between gap-2 bg-white/5 border border-white/5 rounded-2xl px-4 py-3">
                     <span className="flex items-center gap-2.5 text-[13px] text-neutral-400 shrink-0">
+                      <Mail size={16} className="text-neutral-500" />
+                      Почта
+                    </span>
+                    {editingLogin ? (
+                      <div className="flex items-center gap-2 flex-1 justify-end min-w-0">
+                        <input
+                          autoFocus
+                          type="email"
+                          inputMode="email"
+                          value={loginDraft}
+                          onChange={(e) => {
+                            setLoginDraft(e.target.value);
+                            setLoginError("");
+                          }}
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter") handleSaveLogin();
+                          }}
+                          className="min-w-0 flex-1 bg-[#121212] border border-green-500/40 rounded-lg px-3 py-1.5 text-[14px] text-white outline-none"
+                        />
+                        <button
+                          onClick={handleSaveLogin}
+                          disabled={isSavingLogin}
+                          className="w-8 h-8 flex items-center justify-center rounded-lg bg-[#12c83b] text-black active:scale-90 transition-all disabled:opacity-50 shrink-0"
+                        >
+                          {isSavingLogin ? (
+                            <Loader2 size={16} className="animate-spin" />
+                          ) : (
+                            <Check size={16} strokeWidth={3} />
+                          )}
+                        </button>
+                      </div>
+                    ) : (
+                      <button
+                        onClick={() => {
+                          setLoginDraft(accountModal.login);
+                          setLoginError("");
+                          setEditingLogin(true);
+                        }}
+                        className="flex items-center gap-2 min-w-0 active:scale-95 transition-all"
+                      >
+                        <span className="text-[14px] font-semibold text-white truncate">{accountModal.login}</span>
+                        <Pencil size={14} className="text-neutral-500 shrink-0" />
+                      </button>
+                    )}
+                  </div>
+                  {loginError && <div className="-mt-1 px-1 text-[12px] text-red-400">{loginError}</div>}
+
+                  <div className="flex items-center justify-between gap-2 bg-white/5 border border-white/5 rounded-2xl px-4 py-3">
+                    <span className="flex items-center gap-2.5 text-[13px] text-neutral-400 shrink-0">
                       <Wallet size={16} className="text-neutral-500" />
                       Потрачено
                     </span>
@@ -1827,7 +2407,7 @@ export default function CatalogScreen({
                             if (e.key === "Enter") handleSaveSpent();
                           }}
                           placeholder="0"
-                          className="w-24 bg-[#121212] border border-green-500/40 rounded-lg px-3 py-1.5 text-[15px] text-white text-right outline-none"
+                          className="w-24 bg-[#121212] border border-green-500/40 rounded-lg px-3 py-1.5 text-[15px] text-white text-right outline-none [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
                         />
                         <button
                           onClick={handleSaveSpent}
@@ -1901,6 +2481,52 @@ export default function CatalogScreen({
                   </div>
                 </div>
               )}
+
+              {deleteAccountError && (
+                <div className="mt-4 px-1 text-[13px] text-red-400 text-center">{deleteAccountError}</div>
+              )}
+              {confirmDeleteAccount ? (
+                <div className="mt-4 flex gap-2">
+                  <motion.button
+                    whileTap={{ scale: 0.95 }}
+                    onClick={() => setConfirmDeleteAccount(false)}
+                    disabled={isDeletingAccount}
+                    style={{ WebkitTapHighlightColor: "transparent" }}
+                    className="flex-1 h-12 rounded-[18px] border border-white/10 bg-white/[0.06] text-white text-[15px] disabled:opacity-60"
+                  >
+                    Отмена
+                  </motion.button>
+                  <motion.button
+                    whileTap={{ scale: 0.95 }}
+                    onClick={handleDeleteAccount}
+                    disabled={isDeletingAccount}
+                    style={{ WebkitTapHighlightColor: "transparent" }}
+                    className="flex-1 h-12 rounded-[18px] bg-[#ff3b30] text-white text-[15px] font-semibold disabled:opacity-60"
+                  >
+                    {isDeletingAccount ? "Удаляется..." : "Да, удалить"}
+                  </motion.button>
+                </div>
+              ) : (
+                <>
+                  <motion.button
+                    whileTap={accountOrdersCount === 0 ? { scale: 0.97 } : undefined}
+                    onClick={() => {
+                      setDeleteAccountError("");
+                      setConfirmDeleteAccount(true);
+                    }}
+                    disabled={accountOrdersCount !== 0}
+                    style={{ WebkitTapHighlightColor: "transparent" }}
+                    className="mt-4 h-12 rounded-[18px] border border-[#ff3b30]/30 bg-[#ff3b30]/10 text-[#ff3b30] text-[15px] font-semibold flex items-center justify-center gap-2 disabled:opacity-40 disabled:cursor-not-allowed"
+                  >
+                    <Trash2 size={16} /> Удалить аккаунт
+                  </motion.button>
+                  {accountOrdersCount !== null && accountOrdersCount > 0 && (
+                    <div className="mt-2 px-1 text-[12px] text-neutral-500 text-center">
+                      Нельзя удалить: на аккаунте есть заказы ({accountOrdersCount})
+                    </div>
+                  )}
+                </>
+              )}
             </motion.div>
           </div>
         )}
@@ -1925,6 +2551,19 @@ export default function CatalogScreen({
           kind={categoryTab === "подписки" ? "подписки" : "игры"}
         />
       )}
+
+      <AnimatePresence>
+        {addOrderLogin && (
+          <AddOrderModal
+            onClose={() => setAddOrderLogin(null)}
+            gamesList={items}
+            variables={variables}
+            fetchItems={fetchItems}
+            API_URL={API_URL}
+            initialLogin={addOrderLogin}
+          />
+        )}
+      </AnimatePresence>
 
       <AnimatePresence>
         {isQrOpen && <PaymentQrModal onClose={() => setIsQrOpen(false)} />}

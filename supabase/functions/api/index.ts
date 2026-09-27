@@ -140,15 +140,13 @@ async function buildCatalog() {
     const ed = (a.edition ?? "").trim();
     if (!accMap[key]) accMap[key] = {};
     if (!accMap[key][ed]) accMap[key][ed] = [];
+    const notes = a.slot_notes ?? {};
     accMap[key][ed].push({
       email: (a.login ?? "").trim() || "Без почты",
-      slots: [
-        { isOccupied: toBool(a.slot1) },
-        { isOccupied: toBool(a.slot2) },
-        { isOccupied: toBool(a.slot3) },
-        { isOccupied: toBool(a.slot4) },
-        { isOccupied: toBool(a.slot5) },
-      ],
+      slots: [a.slot1, a.slot2, a.slot3, a.slot4, a.slot5].map((occupied, i) => ({
+        isOccupied: toBool(occupied),
+        note: notes[String(i + 1)] ?? "",
+      })),
     });
   }
 
@@ -306,6 +304,8 @@ const ADMIN_ACTIONS = new Set([
   "updateActivity",
   "deleteActivity",
   "restoreActivity",
+  "deleteAccount",
+  "deleteGame",
 ]);
 
 function slotFieldForBase(base: string) {
@@ -315,14 +315,20 @@ function slotFieldForBase(base: string) {
   return null;
 }
 
-async function applySlot(row: any, slotName: string) {
+// preferredField — точный слот (slot1..slot5): при возврате освобождаем слот именно этого клиента.
+// Без него для П3 работает прежнее правило (занимаем первый свободный, освобождаем второй).
+async function applySlot(row: any, slotName: string, preferredField = "") {
   const isReturn = slotName.toLowerCase().indexOf("возврат") !== -1;
   const base = slotName.replace(/возврат\s*/i, "").trim();
   const valToSet = !isReturn;
 
   let targetField: string | null = null;
+  const isP3 = base === "PS5 П3" || base === "П3";
+  const allowedFields = isP3 ? ["slot1", "slot2"] : [slotFieldForBase(base)];
 
-  if (base === "PS5 П3" || base === "П3") {
+  if (preferredField && allowedFields.includes(preferredField)) {
+    targetField = preferredField;
+  } else if (isP3) {
     const d = toBool(row.slot1);
     const e = toBool(row.slot2);
     if (isReturn) {
@@ -399,11 +405,12 @@ async function allocateSlot(
   currency: string,
   purchaseDate: string,
   track: { slot?: any; createdAccountId?: string } = {},
+  slotField = "",
 ) {
   const found = await findAccountByLogin(loginValue);
 
   if (found) {
-    track.slot = await applySlot(found, slotStr);
+    track.slot = await applySlot(found, slotStr, slotField);
     return;
   }
 
@@ -728,10 +735,15 @@ async function handleAddOrder(data: any) {
       data.currency,
       finalDate,
       track,
+      str(data.slotField),
     );
   } catch (err) {
     hasErrors = true;
     slotErrorMsg = (err as Error).message;
+  }
+  // Запоминаем, какой именно слот занял/освободил заказ (два П3 иначе не различить)
+  if (track.slot?.field) {
+    await db.from("orders").update({ slot_field: track.slot.field }).eq("id", order.id);
   }
 
   try {
@@ -783,11 +795,13 @@ async function handleGetSlotHistory(data: any) {
   const target = (data.login ?? "").toString().trim().toLowerCase();
   const { data: rows } = await db
     .from("orders")
-    .select("client, slot, created_at, price, event")
+    .select("id, client, slot, slot_field, created_at, price, event")
     .ilike("login", target)
     .order("created_at", { ascending: true });
 
   const history = (rows ?? []).map((r: any) => ({
+    id: r.id,
+    slotField: r.slot_field ?? null,
     client: r.client ?? "",
     slot: r.slot ?? "",
     date: fmtDate(r.created_at),
@@ -933,6 +947,12 @@ async function fetchRef(table: string, id: unknown) {
 
 function str(value: unknown) {
   return (value ?? "").toString().trim();
+}
+
+// Почта для ilike без учёта регистра, но буквально: "_" и "%" в ilike — шаблоны
+// ("_" — любой символ), а в почтах подчёркивание встречается часто
+function exactLogin(value: string) {
+  return value.replace(/[\\%_]/g, (c) => "\\" + c);
 }
 
 // Текущие значения полей записи журнала. null — исходных данных больше нет
@@ -1772,6 +1792,172 @@ async function handleUpdateAccountExpense(data: any) {
   return json({ success: true });
 }
 
+// Удаление игры/подписки из настроек — по тем же правилам, что откат «Добавлена игра» в журнале:
+// нельзя, пока у игры есть аккаунты; всё удалённое уходит в журнал и восстанавливается оттуда.
+async function handleDeleteGame(data: any) {
+  const { data: game, error } = await db.from("catalog_items").select("*").eq("id", str(data.id)).maybeSingle();
+  if (error) throw error;
+  if (!game) return json({ success: false, error: "Игра не найдена" });
+
+  const { count } = await db
+    .from("accounts")
+    .select("id", { count: "exact", head: true })
+    .eq("game_name", game.name)
+    .eq("kind", game.type);
+  if (count) return json({ success: false, error: `У игры есть аккаунты (${count}). Сначала удалите их.` });
+
+  const journal: JournalStep[] = [];
+  // Записи журнала об этой игре (добавление, издания, цены) — иначе их откат ссылался бы на удалённую игру
+  const { data: related } = await db
+    .from("activity_log")
+    .select("*")
+    .eq("type", "game")
+    .eq("game_name", game.name)
+    .neq("action", "deleted");
+  await deleteRows(journal, "activity_log", related ?? []);
+  await deleteRows(journal, "catalog_items", [game]);
+
+  const isSub = String(game.type).toLowerCase().includes("подп");
+  await logActivity("game", "deleted", isSub ? "Удалена подписка" : "Удалена игра", {
+    details: game.name,
+    gameName: game.name,
+    actor: data.actor,
+    undo: { journal },
+  });
+  return json({ success: true });
+}
+
+// Смена почты (логина) аккаунта. Заказы и журнал связаны с аккаунтом по почте,
+// поэтому переписываем её и там (в пределах этой игры) — иначе история аккаунта потеряется.
+async function handleUpdateAccountLogin(data: any) {
+  const oldLogin = str(data.login);
+  const newLogin = str(data.newLogin);
+  if (!oldLogin || !newLogin) return json({ success: false, error: "Укажите почту" });
+  if (newLogin === oldLogin) return json({ success: true, login: newLogin });
+
+  const { data: rows, error } = await db
+    .from("accounts")
+    .select("id")
+    .eq("game_name", data.gameName)
+    .eq("edition", data.edition)
+    .ilike("login", exactLogin(oldLogin));
+  if (error) throw error;
+  const account = rows?.[0];
+  if (!account) return json({ success: false, error: "Аккаунт не найден" });
+
+  // Регистр букв в почте поменять можно, а занять почту другого аккаунта — нет
+  if (newLogin.toLowerCase() !== oldLogin.toLowerCase()) {
+    const { data: taken, error: takenError } = await db
+      .from("accounts")
+      .select("id")
+      .ilike("login", exactLogin(newLogin))
+      .limit(1);
+    if (takenError) throw takenError;
+    if (taken && taken.length > 0) return json({ success: false, error: "Аккаунт с такой почтой уже есть" });
+  }
+
+  const { error: accountError } = await db.from("accounts").update({ login: newLogin }).eq("id", account.id);
+  if (accountError) throw accountError;
+  await db.from("orders").update({ login: newLogin }).ilike("login", exactLogin(oldLogin)).eq("game_name", data.gameName);
+  await db.from("activity_log").update({ login: newLogin }).ilike("login", exactLogin(oldLogin)).eq("game_name", data.gameName);
+
+  await logActivity("account", "account_login", "Изменена почта аккаунта", {
+    details: `${oldLogin} → ${newLogin}`,
+    login: newLogin,
+    gameName: data.gameName ?? "",
+    actor: data.actor,
+    refId: account.id,
+  });
+  return json({ success: true, login: newLogin });
+}
+
+// Удаление аккаунта из окна «Аккаунт» — по тем же правилам, что откат «Добавлен аккаунт» в журнале:
+// нельзя, пока на аккаунте есть заказы; всё удалённое уходит в журнал и восстанавливается оттуда.
+async function handleDeleteAccount(data: any) {
+  const { data: rows, error } = await db
+    .from("accounts")
+    .select("*")
+    .eq("game_name", data.gameName)
+    .eq("edition", data.edition)
+    .ilike("login", exactLogin(str(data.login)));
+  if (error) throw error;
+  const account = rows?.[0];
+  if (!account) return json({ success: false, error: "Аккаунт не найден" });
+
+  const orders = await countOrders(account.login, account.game_name);
+  if (orders > 0) {
+    return json({
+      success: false,
+      error: `На аккаунте есть заказы (${orders}). Сначала удалите их в истории.`,
+    });
+  }
+
+  const journal: JournalStep[] = [];
+  // Ручные «занять/освободить слот» — это не заказы, удаляются вместе с аккаунтом
+  const { data: manual } = await db
+    .from("orders")
+    .select("*")
+    .ilike("login", exactLogin(account.login))
+    .eq("game_name", account.game_name);
+  await deleteRows(journal, "orders", manual ?? []);
+  // Запись «Добавлен аккаунт» тоже убираем: её откат ссылался бы на удалённый аккаунт
+  const { data: added } = await db
+    .from("activity_log")
+    .select("*")
+    .eq("action", "account_add")
+    .eq("ref_id", account.id);
+  await deleteRows(journal, "activity_log", added ?? []);
+  await deleteRows(journal, "accounts", [account]);
+
+  await logActivity("account", "deleted", "Удалён аккаунт", {
+    details: accountDetails(account.game_name, account.edition, Number(account.expense_total) || 0),
+    login: account.login,
+    gameName: account.game_name,
+    actor: data.actor,
+    undo: { journal },
+  });
+  return json({ success: true });
+}
+
+// Цена (сколько получено) заказа — меняется из окна истории слота
+async function handleUpdateOrderPrice(data: any) {
+  const id = str(data.orderId);
+  const { data: order, error } = await db.from("orders").select("id, event").eq("id", id).maybeSingle();
+  if (error) throw error;
+  if (!order || order.event) return json({ success: false, error: "Заказ не найден" });
+
+  const price = parsePrice(data.price);
+  const { error: updateError } = await db.from("orders").update({ price }).eq("id", id);
+  if (updateError) throw updateError;
+  // В журнале у записи заказа своя копия цены — обновляем, чтобы суммы совпадали
+  await db.from("activity_log").update({ price }).eq("ref_id", id).in("action", ["order_add", "order_return"]);
+  return json({ success: true, price });
+}
+
+// Заметка к слоту: пустой текст удаляет заметку
+async function handleUpdateSlotNote(data: any) {
+  const slotNumber = Number(data.slotIndex) + 1;
+  if (!(slotNumber >= 1 && slotNumber <= 5)) return json({ success: false, error: "Неверный слот" }, 400);
+
+  const { data: rows, error } = await db
+    .from("accounts")
+    .select("id, slot_notes")
+    .eq("game_name", data.gameName)
+    .eq("edition", data.edition)
+    .ilike("login", exactLogin(str(data.email)));
+  if (error) throw error;
+  if (!rows || rows.length === 0) return json({ success: false, error: "Аккаунт не найден" }, 404);
+
+  const notes = { ...(rows[0].slot_notes ?? {}) };
+  const note = str(data.note);
+  if (note) notes[String(slotNumber)] = note;
+  else delete notes[String(slotNumber)];
+
+  const { error: updateError } = await db.from("accounts").update({ slot_notes: notes }).eq("id", rows[0].id);
+  if (updateError) throw updateError;
+  return json({ success: true, note });
+}
+
 async function handleToggleSlot(data: any) {
   const field = `slot${Number(data.slotIndex) + 1}`;
   const { data: rows } = await db
@@ -1796,6 +1982,7 @@ async function handleToggleSlot(data: any) {
     edition: data.edition ?? "",
     client: occupied ? "Слот занят вручную" : "Слот освобождён вручную",
     slot: baseSlot,
+    slot_field: field,
     event: occupied ? "manual_occupy" : "manual_free",
     created_at: new Date().toISOString(),
   });
@@ -2319,6 +2506,16 @@ Deno.serve(async (req) => {
           return await handleUpdateAccountExpense(data);
         case "toggleSlot":
           return await handleToggleSlot(data);
+        case "updateSlotNote":
+          return await handleUpdateSlotNote(data);
+        case "deleteAccount":
+          return await handleDeleteAccount(data);
+        case "updateAccountLogin":
+          return await handleUpdateAccountLogin(data);
+        case "updateOrderPrice":
+          return await handleUpdateOrderPrice(data);
+        case "deleteGame":
+          return await handleDeleteGame(data);
         case "addEmptyAccount":
           return await handleAddEmptyAccount(data);
         case "markProblem":
