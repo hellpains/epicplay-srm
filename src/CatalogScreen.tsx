@@ -294,7 +294,8 @@ export default function CatalogScreen({
         const flags = (account?.slots ?? []).map((slot: any) => Boolean(slot.isOccupied));
         const { rows, occupants } = assignSlotFields(result.history, hasBoth, flags);
         const field = `slot${slotIndex + 1}`;
-        const filteredHistory = rows.filter((row) => row.field === field);
+        // Последние изменения — сверху
+        const filteredHistory = rows.filter((row) => row.field === field).reverse();
 
         setHistoryModal(prev =>
           prev
@@ -375,7 +376,7 @@ export default function CatalogScreen({
             ? {
                 ...prev,
                 isOccupied: newOccupied,
-                history: [...prev.history, manualRecord],
+                history: [manualRecord, ...prev.history],
                 occupant: newOccupied
                   ? { client: "", orderId: null, price: null, field: `slot${prev.slotIndex + 1}` }
                   : null,
