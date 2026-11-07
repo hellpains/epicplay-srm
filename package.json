@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "phone-agent": "node agent/phone-agent.mjs"
   },
   "dependencies": {
     "@sparticuz/chromium": "^131.0.1",

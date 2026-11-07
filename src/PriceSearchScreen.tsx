@@ -3,6 +3,7 @@ import { motion, AnimatePresence } from "framer-motion";
 import { Search, Loader2, X, Check, Pencil } from "lucide-react";
 import { API_URL, apiFetch } from "./config";
 import { PS_RATE_REGIONS, RateConverter } from "./components/StandardPrices";
+import { USDT_KEY, USDT_PRICE_KEY } from "./components/UsdtRate";
 
 type PsSuggestion = { name: string; kind: string; platforms: string[]; cover: string };
 type RegionPrice = { code: string; country: string; price: string; basePrice: string | null; rub: number | null };
@@ -64,9 +65,6 @@ function saveRecent(list: PsSuggestion[]) {
   }
 }
 
-// Курс USDT вписывают вручную; хранится в общих настройках «Стандарт» (как курс ступенями)
-const USDT_KEY = "rates|usdt|rub";
-const USDT_PRICE_KEY = "rate|1";
 
 // Конвертер под игрой — только для Украины
 const CONVERTER_REGIONS = PS_RATE_REGIONS.filter((r) => r.id === "ua");

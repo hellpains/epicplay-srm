@@ -22,6 +22,11 @@ const AVITO_WEBHOOK_KEY = Deno.env.get("AVITO_WEBHOOK_KEY") ?? "";
 const CARDLINK_TRANSFER_URL = Deno.env.get("CARDLINK_TRANSFER_URL") ?? "";
 const SBP_ROBOT_URL = Deno.env.get("SBP_ROBOT_URL") ?? "";
 const SBP_ROBOT_KEY = Deno.env.get("SBP_ROBOT_KEY") ?? "";
+// ZovoCard: заказы по кодам CDK (вкладка «CDK»). Ключ работает только с IP из его вайтлиста,
+// поэтому запросы идут через свой прокси с постоянным адресом: http://user:pass@host:port
+const ZOVOCARD_API_KEY = Deno.env.get("ZOVOCARD_API_KEY") ?? "";
+const ZOVO_PROXY_URL = Deno.env.get("ZOVO_PROXY_URL") ?? "";
+const ZOVOCARD_API = "https://zovocard.com/openapi/v1";
 
 const db = createClient(SUPABASE_URL, SERVICE_ROLE_KEY, {
   auth: { persistSession: false },
@@ -71,6 +76,8 @@ const PS_REGIONS: Record<string, { country: string; language: string; locale: st
   in: { country: "IN", language: "en", locale: "en-IN", name: "Индия", currency: "INR" },
   pl: { country: "PL", language: "pl", locale: "pl-PL", name: "Польша", currency: "PLN" },
   us: { country: "US", language: "en", locale: "en-US", name: "США", currency: "USD" },
+  // Японский магазин отвечает только на японском языке; названия многих игр там всё равно английские
+  jp: { country: "JP", language: "ja", locale: "ja-JP", name: "Япония", currency: "JPY" },
 };
 
 async function psStoreSearch(term: string, size = 24, region = "tr") {
@@ -187,7 +194,7 @@ async function getCbrRates() {
 
 // Цены игры во всех регионах — по каждому изданию (обычное, Deluxe, Ultimate…).
 // Издания находим в турецком магазине: товары, чьё название начинается с названия игры.
-// В остальных регионах то же издание ищем по номеру товара — он одинаковый во всех регионах
+// В остальных регионах то же издание ищем по номеру товара, а если он там свой — по названию
 // Слова, из которых состоят названия изданий: «Digital Deluxe Edition», «Cross-Gen Bundle», «PS4 & PS5»
 const EDITION_WORDS = new Set([
   "digital", "standard", "deluxe", "ultimate", "gold", "premium", "complete", "special", "definitive",
@@ -252,7 +259,13 @@ async function handlePsRegionPrices(data: any) {
   const result = editions.map((edition: any) => {
     const prices = Object.entries(PS_REGIONS)
       .map(([code, region]) => {
-        const hit = (byRegion[code] ?? []).find((r: any) => r.id === edition.id);
+        // У игр, которые в регионе выпускает другой издатель (часто в Японии и США), номер товара свой —
+        // тогда берём товар с точно таким же названием
+        const editionName = normalizeGameName(edition.name);
+        const found = byRegion[code] ?? [];
+        const hit =
+          found.find((r: any) => r.id === edition.id) ??
+          found.find((r: any) => !r.isFree && normalizeGameName(r.name) === editionName);
         if (!hit) return null;
         const amount = hit.isFree ? 0 : parseStorePrice(hit.price);
         const rate = rates[region.currency];
@@ -523,6 +536,46 @@ async function login(loginValue: string, password: string) {
   return { success: false, message: "Неверный логин или пароль" };
 }
 
+const MIN_PASSWORD_LENGTH = 6;
+
+// Код приглашения: без него зарегистрироваться нельзя. Секрет не задан — регистрация закрыта совсем
+const REGISTRATION_CODE = Deno.env.get("REGISTRATION_CODE") ?? "";
+
+// Самостоятельная регистрация по коду приглашения: новый пользователь всегда получает роль user
+async function register(loginValue: string, password: string, code: string) {
+  if (!REGISTRATION_CODE) return { success: false, message: "Регистрация закрыта" };
+  if (!safeEqual(code.trim(), REGISTRATION_CODE)) return { success: false, message: "Неверный код приглашения" };
+
+  const newLogin = loginValue.trim();
+  if (newLogin.length < 3 || newLogin.length > 32 || /\s/.test(newLogin)) {
+    return { success: false, message: "Логин: от 3 до 32 символов без пробелов" };
+  }
+  if (password.length < MIN_PASSWORD_LENGTH) {
+    return { success: false, message: `Пароль: минимум ${MIN_PASSWORD_LENGTH} символов` };
+  }
+
+  // Вход не учитывает регистр, поэтому и занятость логина проверяем без его учёта
+  const { data: existing } = await db
+    .from("app_users")
+    .select("id")
+    .ilike("login", newLogin.replace(/[\\%_]/g, "\\$&"))
+    .limit(1);
+  if (existing?.length) return { success: false, message: "Такой логин уже занят" };
+
+  const { data: created, error } = await db
+    .from("app_users")
+    .insert({ login: newLogin, password, role: "user", name: newLogin })
+    .select("login, password, role, name")
+    .single();
+  if (error || !created) {
+    // 23505 — логин заняли между проверкой и вставкой
+    const taken = error?.code === "23505";
+    return { success: false, message: taken ? "Такой логин уже занят" : "Не удалось зарегистрироваться" };
+  }
+
+  return { success: true, role: created.role, name: created.name, token: await issueToken(created) };
+}
+
 // Журнал изменений — только для администратора
 const ADMIN_ACTIONS = new Set([
   "getActivity",
@@ -532,6 +585,8 @@ const ADMIN_ACTIONS = new Set([
   "restoreActivity",
   "deleteAccount",
   "deleteGame",
+  "gptAccounts",
+  "phoneTasks",
 ]);
 
 function slotFieldForBase(base: string) {
@@ -829,6 +884,1058 @@ async function handleUpdateStandardPrices(data: any) {
     undo: { before: before?.prices ?? {} },
   });
   return json({ success: true, prices });
+}
+
+// Вкладка «CDK»: подписки ChatGPT оформляет сервис ZovoCard по кодам CDK. Сервер сам берёт код
+// (неиспользованный с аккаунта или покупает новый), активирует его токеном клиента и следит за заказом.
+// Статусы заказа у ZovoCard: completed — успех; три статуса ниже — окончательный отказ; остальные — в работе
+const CDK_REJECTED = new Set(["declined", "failed_precharge", "cancelled"]);
+const CDK_ORDERS_LIMIT = 50;
+// Адреса активации по коду — без ключа, но привязаны к IP и устройству: ходим на них через тот же прокси
+const ZOVO_CDK_PUBLIC = "https://zovocard.com/api/v1/cdk";
+// Проверка аккаунта клиента у ZovoCard небыстрая: ждём дольше обычного
+const ZOVO_TIMEOUT_MS = 60_000;
+
+function cdkOrderStatus(zovoStatus: string) {
+  if (zovoStatus === "completed") return "success";
+  return CDK_REJECTED.has(zovoStatus) ? "rejected" : "pending";
+}
+
+// Тариф в приложении ("Pro|20") → название тарифа у ZovoCard
+const CDK_PLANS: Record<string, string> = {
+  "Go|1": "go",
+  "Plus|1": "plus",
+  "Pro|5": "pro_5x",
+  "Pro|20": "pro_20x",
+  "Pro|50": "pro_50x",
+};
+
+const CDK_PLAN_LABELS: Record<string, string> = {
+  go: "ChatGPT Go",
+  plus: "ChatGPT Plus",
+  pro_5x: "ChatGPT Pro 5x",
+  pro_20x: "ChatGPT Pro 20x",
+  pro_50x: "ChatGPT Pro 50x",
+};
+
+// Текст ошибки у ZovoCard на китайском, поэтому переводим по коду ошибки
+const ZOVO_ERRORS: Record<string, string> = {
+  GPT_SESSION_INVALID: "Токен клиента недействителен или устарел",
+  GPT_PLAN_ALREADY_ACTIVE: "У клиента ещё действует подписка",
+  PRECHECK_REJECTED: "Аккаунт клиента не прошёл проверку",
+  GPT_PRICE_UNCONFIRMED: "Цена не подтверждена, попробуйте ещё раз",
+  INSUFFICIENT_BALANCE: "Недостаточно средств на балансе ZovoCard",
+  RECHARGE_REQUIRED: "На аккаунте ZovoCard нет зачисленного пополнения",
+  CDK_UNAVAILABLE: "Код CDK уже использован или обрабатывается",
+  CDK_NOT_ACCESSIBLE: "Код CDK недоступен этому ключу ZovoCard",
+  REDEMPTION_SESSION_INVALID: "Сессия активации истекла, попробуйте ещё раз",
+  REDEMPTION_REJECTED: "Сервис отклонил активацию",
+  GPT_PREFLIGHT_RATE_LIMITED: "Слишком много проверок, подождите минуту",
+  DIRECT_PRODUCT_DISABLED: "Сервис активации временно недоступен",
+  GPT_DIRECT_UNAVAILABLE: "Сервис активации временно недоступен",
+  GPT_DIRECT_PAUSED: "Сервис активации приостановлен",
+  GPT_DIRECT_ACCESS_DENIED: "У ключа ZovoCard нет доступа к оформлению подписок",
+  API_SCOPE_UNAVAILABLE: "Ключу ZovoCard запрещено это действие",
+};
+
+// detail — текст сетевой ошибки, когда запрос не дошёл (status 0)
+type ZovoReply = { ok: boolean; status: number; errorCode: string; data: any; detail?: string };
+
+function zovoError(reply: ZovoReply, fallback: string) {
+  if (ZOVO_ERRORS[reply.errorCode]) return ZOVO_ERRORS[reply.errorCode];
+  if (reply.status === 429) return "Слишком много запросов, подождите минуту";
+  return reply.errorCode ? `${fallback} (${reply.errorCode})` : `${fallback} (ответ ${reply.status})`;
+}
+
+// Запрос к ZovoCard через свой прокси. Сетевую ошибку отдаём как status 0 — «неизвестно, дошло ли»
+async function zovoRequest(
+  method: "GET" | "POST",
+  url: string,
+  body: unknown,
+  headers: Record<string, string>,
+): Promise<ZovoReply> {
+  try {
+    const { status, text } = await fetchViaProxy(
+      new URL(url),
+      method,
+      { Accept: "application/json", ...(body ? { "Content-Type": "application/json" } : {}), ...headers },
+      body ? JSON.stringify(body) : "",
+      ZOVO_PROXY_URL,
+      ZOVO_TIMEOUT_MS,
+    );
+    let parsed: any = {};
+    try {
+      parsed = JSON.parse(text);
+    } catch (_e) {
+      parsed = {};
+    }
+    return {
+      ok: status >= 200 && status < 300 && parsed.code === 0,
+      status,
+      errorCode: str(parsed.error_code),
+      data: parsed.data ?? {},
+    };
+  } catch (e) {
+    return { ok: false, status: 0, errorCode: "", data: {}, detail: e instanceof Error ? e.message : String(e) };
+  }
+}
+
+// Запрос к API владельца (по ключу)
+function zovoOwner(method: "GET" | "POST", path: string, body?: unknown, headers: Record<string, string> = {}) {
+  return zovoRequest(method, `${ZOVOCARD_API}${path}`, body, { "X-API-Key": ZOVOCARD_API_KEY, ...headers });
+}
+
+// Последний сбой запроса к ZovoCard — чтобы показать на экране, почему нет баланса и карт,
+// а не молча прятать их
+// ipBlocked — отказ 403 без кода ошибки: так ZovoCard отвечает, когда адрес сервера не в списке
+// разрешённых IP у ключа
+let zovoLastFailure: { at: number; text: string; ipBlocked: boolean } | null = null;
+
+// С какого адреса наши запросы приходят в ZovoCard: спрашиваем у внешнего сервиса через тот же прокси.
+// Этот адрес и нужно добавить в список разрешённых IP ключа. Пусто — узнать не удалось
+async function zovoOutgoingIp() {
+  try {
+    const { status, text } = await fetchViaProxy(
+      new URL("https://api.ipify.org/"),
+      "GET",
+      { Accept: "text/plain" },
+      "",
+      ZOVO_PROXY_URL,
+      10_000,
+    );
+    const ip = text.trim();
+    return status === 200 && /^[0-9a-f.:]{3,45}$/i.test(ip) ? ip : "";
+  } catch (_e) {
+    return "";
+  }
+}
+
+function zovoFailureText(reply: ZovoReply) {
+  if (reply.status === 0) {
+    return `нет связи с ZovoCard (прокси или сеть)${reply.detail ? `: ${reply.detail}` : ""}`;
+  }
+  if (reply.status === 429) return "ZovoCard ограничил частоту запросов (429)";
+  if (reply.status === 401 || reply.status === 403) {
+    return `ZovoCard отказал в доступе (${reply.status}${reply.errorCode ? ` ${reply.errorCode}` : ""})`;
+  }
+  return `ZovoCard ответил ошибкой ${reply.status}${reply.errorCode ? ` ${reply.errorCode}` : ""}`;
+}
+
+// GET к API владельца; возвращает поле data. null — ключ или прокси не настроены
+async function zovoGet(path: string): Promise<any | null> {
+  if (!ZOVOCARD_API_KEY || !ZOVO_PROXY_URL) return null;
+  const reply = await zovoOwner("GET", path);
+  if (!reply.ok) {
+    zovoLastFailure = {
+      at: Date.now(),
+      text: `${zovoFailureText(reply)} — ${path.split("?")[0]}`,
+      ipBlocked: reply.status === 403 && !reply.errorCode,
+    };
+    throw new Error(`ZovoCard ответил ${reply.status}`);
+  }
+  return reply.data;
+}
+
+// Последние заказы по CDK у ZovoCard
+async function zovoCdkOrders(): Promise<any[] | null> {
+  const data = await zovoGet(`/gpt-direct/cdk-orders?page_size=${CDK_ORDERS_LIMIT}`);
+  if (!data) return null;
+  return Array.isArray(data.list) ? data.list : [];
+}
+
+// Баланс ZovoCard: показываем доступное к расходу (spendable_balance), а не общий — часть общего
+// удержана как резерв. null — не настроено или не получилось узнать
+async function zovoBalance(): Promise<{ amount: number; currency: string } | null> {
+  try {
+    const data = await zovoGet("/balance");
+    const amount = Number(data?.spendable_balance);
+    return data && Number.isFinite(amount) ? { amount, currency: str(data.currency) } : null;
+  } catch (_e) {
+    return null;
+  }
+}
+
+// Активные карты ZovoCard с балансом: с них оплачиваются подписки. Наружу отдаём только последние
+// четыре цифры — полный номер и CVV из ответов ZovoCard дальше сервера не идут.
+// exhausted — у карты кончился лимит оформлений: ZovoCard её больше не выберет, можно удалять.
+// Держим полминуты: историю страница обновляет каждые 10 секунд
+// payments — сколько успешных оформлений прошло с карты; null — посчитать не удалось.
+// minRecharge — наименьшая сумма пополнения карты; null — ZovoCard её не назвал
+type CdkCard = {
+  last4: string;
+  balance: number;
+  exhausted: boolean;
+  payments: number | null;
+  minRecharge: number | null;
+};
+// Минимальное пополнение у карты не меняется — запоминаем по id карты, чтобы не спрашивать каждый раз
+const cdkMinRecharge = new Map<number, number>();
+
+// Минимальная сумма по карточным продуктам: {product_code → min_amount}. Запасной источник минимального
+// пополнения для карт, у которых своё значение не заполнено. Продукты не меняются — спрашиваем один раз
+let cdkProductMins: Map<string, number> | null = null;
+async function zovoProductMins() {
+  if (cdkProductMins) return cdkProductMins;
+  const mins = new Map<string, number>();
+  try {
+    const data = await zovoGet("/products");
+    for (const p of Array.isArray(data) ? data : (data?.list ?? [])) {
+      const min = Number(p.min_amount);
+      if (p.product_code && Number.isFinite(min) && min > 0) mins.set(str(p.product_code), min);
+    }
+    if (mins.size > 0) cdkProductMins = mins;
+  } catch (_e) {
+    // не узнали — у карты останется то, что отдал ZovoCard
+  }
+  return mins;
+}
+
+function cardMinRecharge(card: any): number | null {
+  const value = Number(card?.min_recharge);
+  return card?.min_recharge !== undefined && card?.min_recharge !== null && Number.isFinite(value) ? value : null;
+}
+const CDK_CARDS_TTL_MS = 30_000;
+const CDK_CARDS_MAX = 8;
+let cdkCardsCache: { at: number; cards: CdkCard[] } | null = null;
+
+// Остался ли у карты лимит оформлений GPT. remaining: -1 — без лимита, 0 — исчерпан.
+// Не узнали — считаем, что лимит есть: красным карту красим только наверняка
+async function isCardExhausted(cardId: unknown): Promise<boolean> {
+  try {
+    const usage = await zovoGet(`/gpt-direct/cards/${cardId}/usage?product=gpt`);
+    return usage?.remaining !== undefined && usage.remaining !== null && Number(usage.remaining) === 0;
+  } catch (_e) {
+    return false;
+  }
+}
+
+// Лимит ZovoCard на карту: 5 обычных подписок (Go, Plus) или 3 Pro
+const CARD_LIGHT_MAX = 5;
+const CARD_PRO_MAX = 3;
+// Сколько страниц заказов (по 100) просматриваем, считая оформления по картам
+const CARD_USES_PAGES = 10;
+// Счёт оформлений по картам держим три минуты: это несколько запросов к ZovoCard, а меняется он редко
+const CARD_USES_TTL_MS = 180_000;
+let cdkCardUsesCache: { at: number; uses: Map<number, { light: number; pro: number }> } | null = null;
+
+// Сколько успешных оформлений прошло с каждой карты: {id карты → обычных и Pro}. Считаем сами по заказам
+// аккаунта из всех источников (сайт, API, CDK): остаток лимита от ZovoCard приходит не всегда.
+// Не получилось — null: неполный счёт не показываем
+async function zovoCardUses() {
+  if (cdkCardUsesCache && Date.now() - cdkCardUsesCache.at < CARD_USES_TTL_MS) return cdkCardUsesCache.uses;
+  const uses = new Map<number, { light: number; pro: number }>();
+  try {
+    let query = "page_size=100";
+    for (let page = 0; page < CARD_USES_PAGES; page++) {
+      const data = await zovoGet(`/gpt-direct/account-orders?${query}`);
+      for (const o of data?.list ?? []) {
+        if (str(o.status) !== "completed" || !o.card_id) continue;
+        const card = uses.get(Number(o.card_id)) ?? { light: 0, pro: 0 };
+        if (str(o.plan).startsWith("pro")) card.pro++;
+        else card.light++;
+        uses.set(Number(o.card_id), card);
+      }
+      if (!data?.has_more || !data.next_cursor) break;
+      query = `cursor=${encodeURIComponent(str(data.next_cursor))}&page_size=100`;
+    }
+  } catch (_e) {
+    return null;
+  }
+  cdkCardUsesCache = { at: Date.now(), uses };
+  return uses;
+}
+
+async function zovoCards(): Promise<CdkCard[] | null> {
+  if (cdkCardsCache && Date.now() - cdkCardsCache.at < CDK_CARDS_TTL_MS) return cdkCardsCache.cards;
+  try {
+    const data = await zovoGet("/cards?status=ACTIVE&page_size=100");
+    if (!data) return null;
+    const uses = await zovoCardUses();
+    // Старая карта слева, новая справа: номера карт у ZovoCard растут по порядку выпуска.
+    // Если карт больше, чем помещается, показываем самые новые
+    const list = [...(data.list ?? [])].sort((a, b) => Number(a.id) - Number(b.id)).slice(-CDK_CARDS_MAX);
+    const cards: CdkCard[] = [];
+    for (const c of list) {
+      let balance = Number(c.available_amount ?? c.balance);
+      let number = str(c.card_last_four || c.card_number);
+      let minRecharge = cdkMinRecharge.get(Number(c.id)) ?? cardMinRecharge(c);
+      let productCode = str(c.product_code);
+      // В списке баланса или минимального пополнения может не быть (или там 0 вместо настоящего
+      // значения) — тогда смотрим данные самой карты
+      if (!Number.isFinite(balance) || !minRecharge) {
+        const detail = await zovoGet(`/cards/${c.id}`).catch(() => null);
+        if (!Number.isFinite(balance)) {
+          balance = Number(detail?.available_amount);
+          number = number || str(detail?.card_number);
+        }
+        minRecharge = cardMinRecharge(detail) ?? minRecharge;
+        productCode = productCode || str(detail?.product_code);
+      }
+      // У карты минимум так и не указан (ZovoCard отдаёт 0) — берём минимальную сумму её карточного продукта
+      if (!minRecharge) minRecharge = (await zovoProductMins()).get(productCode) ?? minRecharge;
+      if (minRecharge) cdkMinRecharge.set(Number(c.id), minRecharge);
+      if (Number.isFinite(balance)) {
+        const used = uses?.get(Number(c.id)) ?? { light: 0, pro: 0 };
+        const overLimit = used.light >= CARD_LIGHT_MAX || used.pro >= CARD_PRO_MAX;
+        cards.push({
+          last4: number.slice(-4),
+          balance,
+          exhausted: overLimit || (await isCardExhausted(c.id)),
+          payments: uses ? used.light + used.pro : null,
+          minRecharge,
+        });
+      }
+    }
+    cdkCardsCache = { at: Date.now(), cards };
+    return cards;
+  } catch (_e) {
+    // ZovoCard не ответил — показываем карты, какими видели их в прошлый раз, а не прячем
+    return cdkCardsCache?.cards ?? null;
+  }
+}
+
+// Сколько единиц валюты в одном долларе: {"PHP": 62.75}. ZovoCard называет цены в валюте региона
+// (для GPT — песо), а в доллары мы переводим сами по рыночному курсу; курс обновляется раз в сутки
+const USD_RATES_URL = "https://open.er-api.com/v6/latest/USD";
+const USD_RATES_TTL_MS = 6 * 60 * 60_000;
+let usdRatesCache: { at: number; rates: Record<string, number> } | null = null;
+
+async function usdRates(): Promise<Record<string, number>> {
+  if (usdRatesCache && Date.now() - usdRatesCache.at < USD_RATES_TTL_MS) return usdRatesCache.rates;
+  try {
+    const body = await (await fetch(USD_RATES_URL)).json();
+    if (body.result === "success" && body.rates) usdRatesCache = { at: Date.now(), rates: body.rates };
+  } catch (_e) {
+    // Курс не узнали — отдадим прошлый, если он был
+  }
+  return usdRatesCache?.rates ?? {};
+}
+
+// Цены подписок GPT у ZovoCard по тарифам: {"plus": {amount, currency, amountUsd, feeUsd, available}}.
+// Это ориентир: точную сумму ZovoCard называет при проверке аккаунта, а списывает по своему курсу.
+// Меняются редко, поэтому держим 5 минут
+type CdkPrice = { amount: number; currency: string; amountUsd: number | null; feeUsd: number; available: boolean };
+const CDK_PRICES_TTL_MS = 5 * 60_000;
+let cdkPricesCache: { at: number; prices: Record<string, CdkPrice> } | null = null;
+
+async function zovoPrices(): Promise<Record<string, CdkPrice> | null> {
+  if (cdkPricesCache && Date.now() - cdkPricesCache.at < CDK_PRICES_TTL_MS) return cdkPricesCache.prices;
+  try {
+    const [data, rates] = await Promise.all([zovoGet("/gpt-direct/plans?product=gpt"), usdRates()]);
+    if (!data) return null;
+    const prices: Record<string, CdkPrice> = {};
+    for (const r of data.registry ?? []) {
+      const plan = data.plans?.[r.acc_plan_key ?? r.key];
+      // Суммы приходят в минорных единицах (сентаво для PHP, центы для USD)
+      const amount = Number(plan?.expectedAmountMinor ?? r.checkout_amount_minor ?? 0) / 100;
+      const currency = str(plan?.currency ?? r.checkout_currency);
+      const rate = currency === "USD" ? 1 : Number(rates[currency]);
+      prices[str(r.key)] = {
+        amount,
+        currency,
+        amountUsd: rate > 0 ? amount / rate : null,
+        feeUsd: Number(r.service_fee_usd_minor ?? plan?.serviceFeeUsdMinor ?? 0) / 100,
+        // Купить можно, только если тариф открыт и в реестре, и у исполнителя
+        available: r.purchasable === true && plan?.enabled === true,
+      };
+    }
+    cdkPricesCache = { at: Date.now(), prices };
+    return prices;
+  } catch (_e) {
+    return null;
+  }
+}
+
+// Сколько потрачено на успешный заказ, в долларах: подписка (ZovoCard называет сумму в валюте региона,
+// переводим по сегодняшнему рыночному курсу) плюс сервисный сбор. null — заказ не оплачен или курса нет
+function cdkSpentUsd(z: any, rates: Record<string, number>): number | null {
+  if (str(z.status) !== "completed") return null;
+  const amount = Number(z.final_amount_minor) / 100;
+  const currency = str(z.currency);
+  const rate = currency === "USD" ? 1 : Number(rates[currency]);
+  if (!(amount > 0) || !(rate > 0)) return null;
+  return amount / rate + (Number(z.service_fee_minor) || 0) / 100;
+}
+
+// Причина отказа по статусу заказа у ZovoCard — известна всегда
+const CDK_REJECT_REASONS: Record<string, string> = {
+  declined: "Оплата не прошла",
+  failed_precharge: "Не удалось подготовить оплату",
+  cancelled: "Заказ отменён",
+};
+// Подробности отказа лежат в данных самого заказа у ZovoCard. Отклонённый заказ уже не меняется —
+// запоминаем по его номеру; за один запрос истории спрашиваем не больше нескольких новых
+const CDK_REJECT_FETCH = 5;
+const cdkRejectDetails = new Map<number, any>();
+
+async function loadCdkRejectDetails(orderIds: number[]) {
+  const missing = orderIds.filter((id) => id && !cdkRejectDetails.has(id)).slice(0, CDK_REJECT_FETCH);
+  await Promise.all(
+    missing.map(async (id) => {
+      try {
+        const detail = await zovoGet(`/gpt-direct/cdk-orders/${id}`);
+        if (detail) cdkRejectDetails.set(id, detail);
+      } catch (_e) {
+        // без подробностей останется причина по статусу
+      }
+    }),
+  );
+}
+
+// Поиск поля в данных отклонённого заказа: сам заказ из списка, он же из подробностей, затем события
+// с последнего
+function cdkRejectLookup(z?: any) {
+  const detail = cdkRejectDetails.get(Number(z?.order_id));
+  const sources = [z, detail?.order, ...[...(detail?.events ?? [])].reverse()].filter(Boolean);
+  return (...keys: string[]) => {
+    for (const source of sources) {
+      for (const key of keys) {
+        const value = str(source[key]);
+        if (value) return value;
+      }
+    }
+    return "";
+  };
+}
+
+// Почему заказ отклонён: причина по статусу и подробности — код ошибки, пояснение и этап, на котором
+// остановилось. Пояснения на китайском не показываем: вместо них код ошибки (переведённый, если знаем перевод)
+function cdkRejectReason(zovoStatus: string, z?: any) {
+  if (!CDK_REJECTED.has(zovoStatus)) return "";
+  const first = cdkRejectLookup(z);
+  const code = first("error_code", "failure_code", "decline_code", "fail_code");
+  const text = first("user_message", "failure_reason", "decline_reason", "fail_reason", "error_message", "message");
+  const stage = first("stage");
+
+  const explained = ZOVO_ERRORS[code] ?? (/[㐀-鿿]/.test(text) ? "" : text);
+  const notes = [ZOVO_ERRORS[code] ? "" : code, stage && stage !== zovoStatus ? `этап: ${stage}` : ""].filter(Boolean);
+  return (
+    [CDK_REJECT_REASONS[zovoStatus], explained].filter(Boolean).join(": ") +
+    (notes.length > 0 ? ` (${notes.join(", ")})` : "")
+  );
+}
+
+// Заказ, которого нет в нашей таблице (оформлен на сайте ZovoCard): почта там замаскирована,
+// а от кода есть только начало
+function cdkExternalView(z: any, rates: Record<string, number>) {
+  const plan = str(z.plan);
+  return {
+    id: `zovo-${z.order_id}`,
+    label: CDK_PLAN_LABELS[plan] ?? plan,
+    email: str(z.account_email),
+    code: `${str(z.code_prefix)}…`,
+    status: cdkOrderStatus(str(z.status)),
+    reason: cdkRejectReason(str(z.status), z),
+    renewalStatus: str(z.renewal_status),
+    spentUsd: cdkSpentUsd(z, rates),
+    createdAt: z.created_at,
+  };
+}
+
+// z — этот же заказ у ZovoCard, если он попал в последние: оттуда автопродление и потраченная сумма
+function cdkOrderView(o: any, z?: any, rates: Record<string, number> = {}) {
+  return {
+    id: o.id,
+    label: o.label,
+    email: o.email,
+    code: o.code,
+    status: o.status,
+    // Почему отклонён. Заказа нет среди последних у ZovoCard — подробности ищем по его номеру
+    reason: cdkRejectReason(str(o.zovo_status), z ?? { order_id: o.zovo_order_id }),
+    // Удалось ли ZovoCard отключить автопродление: warning / manual_required — нужно отключить вручную
+    renewalStatus: z ? str(z.renewal_status) : "",
+    spentUsd: z ? cdkSpentUsd(z, rates) : null,
+    // Кто оформил заказ
+    actor: o.actor ?? "",
+    createdAt: o.created_at,
+  };
+}
+
+// Код CDK для заказа: сначала неиспользованный с аккаунта (оставшийся от прошлой неудачной попытки
+// или купленный на сайте), иначе покупаем новый — за него ZovoCard берёт сервисный сбор
+async function takeCdkCode(plan: string, orderId: string): Promise<{ code: string } | { error: string }> {
+  const unused = await zovoOwner("GET", `/gpt-direct/cdks?status=unused&plan=${plan}&page_size=20`);
+  if (unused.ok) {
+    // Полный код у старых записей может не отдаваться — такие пропускаем
+    const ready = (unused.data.list ?? []).find(
+      (c: any) => str(c.plan) === plan && str(c.status || "unused") === "unused" && str(c.code).length > str(c.code_prefix).length,
+    );
+    if (ready) return { code: str(ready.code) };
+  }
+
+  const issued = await zovoOwner(
+    "POST",
+    "/gpt-direct/cdks",
+    { plan, count: 1, funding_confirmed: true },
+    // С одним ключом повтор запроса не купит второй код
+    { "Idempotency-Key": `mrcrm-cdk-${orderId}` },
+  );
+  const code = str(issued.data?.issued?.[0]?.code);
+  if (!issued.ok || !code) return { error: zovoError(issued, "Не удалось купить код CDK") };
+  return { code };
+}
+
+// Оформление подписки: проверяем токен клиента, берём код, активируем его и записываем заказ.
+// Токен клиента только пересылается в ZovoCard — в базе и журнале он не сохраняется
+async function redeemCdk(data: any) {
+  if (!ZOVOCARD_API_KEY || !ZOVO_PROXY_URL) {
+    return json({ success: false, error: "ZovoCard не настроен на сервере" });
+  }
+  const product = str(data.product);
+  const plan = CDK_PLANS[product];
+  if (!plan) return json({ success: false, error: "Неизвестный тариф" });
+  const session = str(data.session);
+  if (!session) return json({ success: false, error: "Нет токена клиента" });
+  const label = CDK_PLAN_LABELS[plan];
+  const email = str(data.email).slice(0, 200);
+  const credential = { mode: "session", session };
+
+  const id = crypto.randomUUID();
+  const device = `mrcrm-${id}`;
+  const deviceHeader = { "X-Redemption-Device": device };
+
+  // 1. Бесплатная проверка токена — до покупки кода. Если ключу эта проверка запрещена (401/403)
+  // или сеть подвела, идём дальше: токен ещё раз проверится на шаге 3
+  const precheck = await zovoOwner("POST", "/gpt-direct/preflight", { product: "gpt", plan, credential });
+  if (!precheck.ok && precheck.status >= 400 && precheck.status < 500 && ![401, 403].includes(precheck.status)) {
+    return json({ success: false, error: zovoError(precheck, "Аккаунт клиента не прошёл проверку") });
+  }
+
+  // 2. Код
+  const taken = await takeCdkCode(plan, id);
+  if ("error" in taken) return json({ success: false, error: taken.error });
+  const code = taken.code;
+  // Начиная отсюда код уже есть на аккаунте: при любой неудаче он остаётся неиспользованным
+  // и уйдёт на следующее оформление этого тарифа
+  const kept = "Купленный код остался на аккаунте ZovoCard и будет использован в следующий раз.";
+
+  // 3. Проверка кода и аккаунта клиента
+  const preview = await zovoRequest("POST", `${ZOVO_CDK_PUBLIC}/preview`, { code }, deviceHeader);
+  const redemptionToken = str(preview.data.redemption_token);
+  if (!preview.ok || !redemptionToken) {
+    return json({ success: false, error: `${zovoError(preview, "Сервис не принял код CDK")}. ${kept}` });
+  }
+  const preflight = await zovoRequest(
+    "POST",
+    `${ZOVO_CDK_PUBLIC}/preflight`,
+    { redemption_token: redemptionToken, credential },
+    deviceHeader,
+  );
+  const preflightToken = str(preflight.data.preflight_token);
+  if (!preflight.ok || !preflightToken) {
+    return json({ success: false, error: `${zovoError(preflight, "Аккаунт клиента не прошёл проверку")}. ${kept}` });
+  }
+
+  // 4. Запись заказа — до активации: если активация оборвётся, заказ не потеряется, статус подтянет сверка
+  const { data: order, error } = await db
+    .from("cdk_orders")
+    .insert({ id, product, label, email, code, redemption_token: redemptionToken, device, actor: str(data.actorLogin) })
+    .select("*")
+    .single();
+  if (error) return json({ success: false, error: `${error.message}. ${kept}` });
+
+  // 5. Активация
+  const redeem = await zovoOwner(
+    "POST",
+    "/gpt-direct/cdks/redeem",
+    { redemption_token: redemptionToken, preflight_token: preflightToken, client_request_id: id },
+    deviceHeader,
+  );
+  // Явный отказ (кроме 409 — там заказ мог уже существовать): заказа нет, запись убираем
+  if (!redeem.ok && redeem.status >= 400 && redeem.status < 500 && redeem.status !== 409) {
+    await db.from("cdk_orders").delete().eq("id", id);
+    return json({ success: false, error: `${zovoError(redeem, "Сервис не принял заказ")}. ${kept}` });
+  }
+
+  const zovoStatus = str(redeem.data?.order?.status);
+  if (redeem.ok && zovoStatus) {
+    const patch = {
+      zovo_status: zovoStatus,
+      status: cdkOrderStatus(zovoStatus),
+      zovo_order_id: Number(redeem.data.order.order_id) || null,
+      updated_at: new Date().toISOString(),
+    };
+    await db.from("cdk_orders").update(patch).eq("id", id);
+    Object.assign(order, patch);
+  }
+
+  await logActivity("game", "cdk_order", "Оформлена подписка ChatGPT", {
+    details: [label, email, code].filter(Boolean).join(" · "),
+    actor: data.actor,
+  });
+  return json({ success: true, order: cdkOrderView(order) });
+}
+
+// Раньше в заказ записывалось имя сотрудника («Администратор»), теперь — логин. Чтобы старые заказы
+// не числились за отдельным человеком, имя переводим в логин: {имя → логин}
+async function cdkActorLogins() {
+  const { data } = await db.from("app_users").select("login, name, role");
+  const logins = new Map<string, string>();
+  // Логины с ролью gpt: по их оформлениям считается долг
+  const gptLogins: string[] = [];
+  for (const u of data ?? []) {
+    if (u.name && u.name !== u.login) logins.set(u.name, u.login);
+    if (u.role === "gpt") gptLogins.push(u.login);
+  }
+  return { logins, gptLogins };
+}
+
+// Сколько заказов отдаём за раз. Фильтры истории по дням и людям работают в браузере,
+// поэтому сразу отдаём много: смена фильтра не ходит на сервер
+const CDK_HISTORY_LIMIT = 1000;
+
+// Подписка оформлена не через ZovoCard, а записана в долг вручную (страница «Долги»): кода у неё нет,
+// вместо него эта пометка. В истории вкладки «CDK» такие записи не показываем
+const CDK_MANUAL_CODE = "manual";
+
+// Сколько рублей сотрудник с ролью gpt должен сверх закупочной цены за каждую оформленную подписку
+const CDK_DEBT_MARKUP_RUB = 50;
+
+// Курс USDT из шапки (общие настройки «Стандарт»); 0 — курс не задан
+async function cdkUsdtRate(): Promise<number> {
+  const { data } = await db.from("standard_prices").select("prices").eq("key", "rates|usdt|rub").maybeSingle();
+  return Number((data?.prices as Record<string, unknown> | undefined)?.["rate|1"]) || 0;
+}
+
+// Долг за одно оформление тарифа (по его названию из заказа): закупочная цена ZovoCard со сбором
+// по курсу USDT плюс наценка. null — цену или курс не знаем
+function cdkDebtRub(label: string, prices: Record<string, CdkPrice> | null, usdtRate: number): number | null {
+  const plan = Object.keys(CDK_PLAN_LABELS).find((key) => CDK_PLAN_LABELS[key] === label);
+  const price = plan ? prices?.[plan] : undefined;
+  if (!price || price.amountUsd == null || !(usdtRate > 0)) return null;
+  return Math.round((price.amountUsd + price.feeUsd) * usdtRate) + CDK_DEBT_MARKUP_RUB;
+}
+
+// op: "list" — история заказов с балансом и ценами; "redeem" — оформить подписку
+async function handleCdkOrders(data: any) {
+  switch (data.op) {
+    case "list": {
+      // before — время самого старого из уже показанных заказов: тогда отдаём следующую, более старую страницу.
+      // Берём на одну строку больше, чтобы знать, есть ли ещё
+      const before = str(data.before);
+      let query = db
+        .from("cdk_orders")
+        .select("*")
+        .neq("code", CDK_MANUAL_CODE)
+        .order("created_at", { ascending: false })
+        .limit(CDK_HISTORY_LIMIT + 1);
+      if (before) query = query.lt("created_at", before);
+      const [{ data: found, error }, { logins, gptLogins }] = await Promise.all([query, cdkActorLogins()]);
+      if (error) return json({ success: false, error: error.message });
+      const hasMore = (found ?? []).length > CDK_HISTORY_LIMIT;
+      const rows = (found ?? []).slice(0, CDK_HISTORY_LIMIT);
+      for (const row of rows) row.actor = logins.get(str(row.actor)) ?? str(row.actor);
+
+      // Старые страницы с ZovoCard не сверяем: он отдаёт только последние заказы
+      if (before) return json({ success: true, hasMore, orders: rows.map((o) => cdkOrderView(o)) });
+
+      // Сверяемся с ZovoCard: он знает настоящий статус каждого заказа. Не получилось — отдаём, что есть
+      const startedAt = Date.now();
+      // Что пошло не так с ZovoCard за этот запрос; пусто — всё получили
+      const zovoIssue = async () => {
+        if (!ZOVOCARD_API_KEY || !ZOVO_PROXY_URL) return "ZovoCard не настроен на сервере";
+        if (!zovoLastFailure || zovoLastFailure.at < startedAt) return "";
+        if (!zovoLastFailure.ipBlocked) return zovoLastFailure.text;
+        const ip = await zovoOutgoingIp();
+        return (
+          `${zovoLastFailure.text}. Скорее всего, адрес сервера не в списке разрешённых IP у ключа ZovoCard` +
+          (ip ? `; сейчас запросы идут с адреса ${ip}` : "")
+        );
+      };
+      const [remote, balance, prices, rates, cards] = await Promise.all([
+        zovoCdkOrders().catch(() => null),
+        zovoBalance(),
+        zovoPrices(),
+        usdRates(),
+        zovoCards(),
+      ]);
+      if (!remote) {
+        return json({
+          success: true,
+          hasMore,
+          balance,
+          cards,
+          prices,
+          gptLogins,
+          zovoIssue: await zovoIssue(),
+          orders: rows.map((o) => cdkOrderView(o)),
+        });
+      }
+
+      const matched = new Set<number>();
+      // Наш заказ и он же у ZovoCard, если попал в последние
+      const pairs: [any, any][] = [];
+      for (const row of rows) {
+        // Наш id заказа уходит в ZovoCard как client_request_id (сайт может добавить к нему приставку)
+        const z = remote.find(
+          (r) =>
+            str(r.client_request_id).includes(row.id) ||
+            (row.zovo_order_id && Number(r.order_id) === Number(row.zovo_order_id)),
+        );
+        if (z) {
+          matched.add(Number(z.order_id));
+          const zovoStatus = str(z.status);
+          if (row.status === "pending" && zovoStatus && (zovoStatus !== row.zovo_status || !row.zovo_order_id)) {
+            const patch = {
+              zovo_status: zovoStatus,
+              status: cdkOrderStatus(zovoStatus),
+              zovo_order_id: Number(z.order_id),
+              updated_at: new Date().toISOString(),
+            };
+            await db.from("cdk_orders").update(patch).eq("id", row.id).eq("status", "pending");
+            Object.assign(row, patch);
+          }
+        }
+        pairs.push([row, z]);
+      }
+      const external = remote.filter((z) => !matched.has(Number(z.order_id)));
+
+      // Подробности отказов — до сборки списка: по ним считается причина. Новые заказы первыми
+      await loadCdkRejectDetails([
+        ...external.filter((z) => CDK_REJECTED.has(str(z.status))).map((z) => Number(z.order_id)),
+        ...rows.filter((row) => CDK_REJECTED.has(str(row.zovo_status))).map((row) => Number(row.zovo_order_id)),
+      ]);
+
+      const orders = [
+        ...pairs.map(([row, z]) => cdkOrderView(row, z, rates)),
+        ...external.map((z) => cdkExternalView(z, rates)),
+      ];
+      orders.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+      return json({ success: true, hasMore, balance, cards, prices, gptLogins, zovoIssue: await zovoIssue(), orders });
+    }
+    case "debts": {
+      // Для долга в шапке: только успешные оформления из нашей базы (кто, тариф, почта клиента)
+      // и цены. Карты, баланс и сверку с ZovoCard не трогаем — поэтому отвечает быстро
+      const PAGE = 1000;
+      type DebtRow = {
+        id: string; label: string; actor: string; email: string; code: string; created_at: string; debt_rub?: number | null;
+      };
+      // Колонки debt_rub ещё нет (миграция 0022 не применена) — читаем без неё, суммы не фиксируем
+      let hasDebtColumn = true;
+      const loadRows = async () => {
+        const rows: DebtRow[] = [];
+        for (let from = 0; ; from += PAGE) {
+          const query = (columns: string) =>
+            db
+              .from("cdk_orders")
+              .select(columns)
+              .eq("status", "success")
+              .order("created_at", { ascending: false })
+              .range(from, from + PAGE - 1);
+          let { data: page, error } = await query(
+            hasDebtColumn ? "id, label, actor, email, code, created_at, debt_rub" : "id, label, actor, email, code, created_at",
+          );
+          if (error && hasDebtColumn && /debt_rub/.test(error.message)) {
+            hasDebtColumn = false;
+            ({ data: page, error } = await query("id, label, actor, email, code, created_at"));
+          }
+          if (error) throw new Error(error.message);
+          rows.push(...((page ?? []) as unknown as DebtRow[]));
+          if ((page ?? []).length < PAGE) return rows;
+        }
+      };
+      try {
+        const [rows, { logins, gptLogins }, prices, paid, usdtRate] = await Promise.all([
+          loadRows(),
+          cdkActorLogins(),
+          zovoPrices(),
+          // Выплаты долга. Таблицы ещё нет (миграция не применена) — считаем, что выплат не было
+          db.from("cdk_debt_payments").select("id, login, amount, created_at").order("created_at", { ascending: false }),
+          cdkUsdtRate(),
+        ]);
+        // Оформления без зафиксированной суммы долга (только что стали успешными) — фиксируем по
+        // сегодняшним ценам и курсу. Дальше сумма хранится в заказе и от цен больше не зависит
+        if (hasDebtColumn) {
+          await Promise.all(
+            rows
+              .filter((row) => row.debt_rub == null)
+              .map(async (row) => {
+                const amount = cdkDebtRub(row.label, prices, usdtRate);
+                if (amount == null) return;
+                const { error } = await db.from("cdk_orders").update({ debt_rub: amount }).eq("id", row.id).is("debt_rub", null);
+                if (!error) row.debt_rub = amount;
+              }),
+          );
+        }
+        const payments = (paid.data ?? []).map((row: any) => ({
+          id: row.id,
+          login: str(row.login),
+          amount: Number(row.amount),
+          createdAt: row.created_at,
+        }));
+        const orders = rows.map((row) => ({
+          id: row.id,
+          actor: logins.get(str(row.actor)) ?? str(row.actor),
+          label: str(row.label),
+          email: str(row.email),
+          manual: row.code === CDK_MANUAL_CODE,
+          // Зафиксированный долг за оформление, ₽; null — зафиксировать не удалось (нет цены или курса)
+          amount: row.debt_rub == null ? null : Number(row.debt_rub),
+          createdAt: row.created_at,
+        }));
+        return json({ success: true, orders, payments, gptLogins, prices: prices ?? {} });
+      } catch (e) {
+        return json({ success: false, error: (e as Error).message });
+      }
+    }
+    case "debtPay": {
+      // Сотрудник с ролью gpt отмечает, что отдал часть долга. Записываем на его логин из токена
+      if (data.actorRole !== "gpt") return json({ success: false, error: "Отдавать долг может только сотрудник с ролью gpt" });
+      const amount = Math.round(Number(data.amount));
+      if (!(amount > 0)) return json({ success: false, error: "Укажите сумму" });
+      const { error } = await db.from("cdk_debt_payments").insert({ login: str(data.actorLogin), amount });
+      if (error) return json({ success: false, error: error.message });
+      await logActivity("game", "cdk_debt_payment", "Отдан долг за подписки ChatGPT", {
+        details: `${amount} ₽`,
+        actor: data.actor,
+      });
+      return json({ success: true });
+    }
+    case "debtAdd": {
+      // Подписку оформили в другом месте, но через нас: записываем её в долг вручную.
+      // Админ записывает на любого сотрудника с ролью gpt, сам сотрудник — только на себя
+      const product = str(data.product);
+      const plan = CDK_PLANS[product];
+      if (!plan) return json({ success: false, error: "Неизвестный тариф" });
+      let login = str(data.actorLogin);
+      if (data.actorRole === "admin") {
+        const { gptLogins } = await cdkActorLogins();
+        const target = str(data.login).toLowerCase();
+        login = gptLogins.find((name) => name.toLowerCase() === target) ?? "";
+        if (!login) return json({ success: false, error: "Выберите сотрудника с ролью gpt" });
+      } else if (data.actorRole !== "gpt") {
+        return json({ success: false, error: "Добавлять подписку в долг может админ или сотрудник с ролью gpt" });
+      }
+      const label = CDK_PLAN_LABELS[plan];
+      const email = str(data.email).trim().slice(0, 200);
+      const { error } = await db
+        .from("cdk_orders")
+        .insert({ product, label, email, code: CDK_MANUAL_CODE, status: "success", actor: login });
+      if (error) return json({ success: false, error: error.message });
+      await logActivity("game", "cdk_debt_manual", "Подписка ChatGPT добавлена в долг вручную", {
+        details: [label, email, login].filter(Boolean).join(" · "),
+        actor: data.actor,
+      });
+      return json({ success: true });
+    }
+    case "debtRemove": {
+      // Убрать из долга подписку, добавленную вручную (например, записали по ошибке). Обычные оформления
+      // не удаляются. Админ убирает любую такую запись, сотрудник с ролью gpt — только свою
+      if (data.actorRole !== "admin" && data.actorRole !== "gpt") {
+        return json({ success: false, error: "Удалять подписку из долга может админ или сотрудник с ролью gpt" });
+      }
+      const { data: row, error: findError } = await db
+        .from("cdk_orders")
+        .select("id, label, email, actor")
+        .eq("id", str(data.id))
+        .eq("code", CDK_MANUAL_CODE)
+        .maybeSingle();
+      if (findError) return json({ success: false, error: findError.message });
+      if (!row) return json({ success: false, error: "Запись не найдена" });
+      if (data.actorRole === "gpt" && str(row.actor).toLowerCase() !== str(data.actorLogin).toLowerCase()) {
+        return json({ success: false, error: "Это запись другого сотрудника" });
+      }
+      const { error } = await db.from("cdk_orders").delete().eq("id", row.id).eq("code", CDK_MANUAL_CODE);
+      if (error) return json({ success: false, error: error.message });
+      await logActivity("game", "cdk_debt_manual_remove", "Подписка ChatGPT, добавленная вручную, удалена из долга", {
+        details: [str(row.label), str(row.email), str(row.actor)].filter(Boolean).join(" · "),
+        actor: data.actor,
+      });
+      return json({ success: true });
+    }
+    case "redeem":
+      return await redeemCdk(data);
+    default:
+      return json({ success: false, error: "Неизвестное действие" });
+  }
+}
+
+// Сохранённые аккаунты ChatGPT в разделе админа «Долги партнёров»: почта, пароль и ключ 2FA.
+// op: "list" — все аккаунты, новые сверху; "add" — сохранить; "remove" — удалить
+async function handleGptAccounts(data: any) {
+  switch (data.op) {
+    case "list": {
+      const { data: rows, error } = await db
+        .from("gpt_accounts")
+        .select("id, email, password, totp, created_at")
+        .order("created_at", { ascending: false });
+      if (error) return json({ success: false, error: error.message });
+      const accounts = (rows ?? []).map((row: any) => ({
+        id: row.id,
+        email: str(row.email),
+        password: str(row.password),
+        totp: str(row.totp),
+        createdAt: row.created_at,
+      }));
+      return json({ success: true, accounts });
+    }
+    case "add": {
+      const email = str(data.email).trim().slice(0, 200);
+      const password = str(data.password).trim().slice(0, 200);
+      // Ключ вставляют группами и в любом регистре — храним слитно и заглавными
+      const totp = str(data.totp).replace(/[\s-]/g, "").toUpperCase().slice(0, 200);
+      if (!email) return json({ success: false, error: "Укажите почту" });
+      if (!password) return json({ success: false, error: "Укажите пароль" });
+      // Сравниваем без учёта регистра; «_» и «%» в почте — обычные знаки, а не подстановки
+      const pattern = email.replace(/[\\%_]/g, "\\$&");
+      const { data: same } = await db.from("gpt_accounts").select("id").ilike("email", pattern).limit(1);
+      if ((same ?? []).length > 0) return json({ success: false, error: "Аккаунт с такой почтой уже сохранён" });
+      const { error } = await db.from("gpt_accounts").insert({ email, password, totp });
+      if (error) return json({ success: false, error: error.message });
+      // Пароль и ключ в журнал не пишем
+      await logActivity("game", "gpt_account_add", "Сохранён аккаунт ChatGPT", { details: email, actor: data.actor });
+      return json({ success: true });
+    }
+    case "remove": {
+      const { data: row, error: findError } = await db
+        .from("gpt_accounts")
+        .select("id, email")
+        .eq("id", str(data.id))
+        .maybeSingle();
+      if (findError) return json({ success: false, error: findError.message });
+      if (!row) return json({ success: false, error: "Аккаунт не найден" });
+      const { error } = await db.from("gpt_accounts").delete().eq("id", row.id);
+      if (error) return json({ success: false, error: error.message });
+      await logActivity("game", "gpt_account_remove", "Удалён сохранённый аккаунт ChatGPT", {
+        details: str(row.email),
+        actor: data.actor,
+      });
+      return json({ success: true });
+    }
+    default:
+      return json({ success: false, error: "Неизвестное действие" });
+  }
+}
+
+// ---------- Телефон с PS App ----------
+// В разделе «Долги партнёров» админ просит войти в сохранённый аккаунт на телефоне или ввести код
+// с экрана консоли. Сайт только создаёт задание; выполняет его программа на компьютере, к которому
+// телефон подключён по USB (agent/phone-agent.mjs): она забирает задание и записывает итог.
+const PHONE_AGENT_KEY = Deno.env.get("PHONE_AGENT_KEY") ?? "";
+// Строка-отметка «программа на связи»: её время обновляется при каждом обращении программы
+const PHONE_AGENT_ROW = "00000000-0000-0000-0000-000000000001";
+// Программа спрашивает задания раз в несколько секунд; молчит дольше — считаем, что она не запущена
+const PHONE_AGENT_ALIVE_MS = 30_000;
+// Задание, которое никто не взял или не закончил за это время, считаем сорвавшимся
+const PHONE_TASK_STALE_MS = 5 * 60_000;
+
+function phoneTaskView(row: any) {
+  if (!row) return null;
+  const stale = Date.now() - new Date(row.updated_at).getTime() > PHONE_TASK_STALE_MS;
+  const waiting = row.status === "pending" || row.status === "running";
+  return {
+    id: row.id,
+    email: str(row.email),
+    code: str(row.code),
+    status: waiting && stale ? "error" : row.status,
+    message: waiting && stale ? "Программа на компьютере не ответила" : str(row.message),
+    createdAt: row.created_at,
+  };
+}
+
+// op: "status" — последние задания и на связи ли программа; "login" — войти в аккаунт; "code" — ввести код консоли
+async function handlePhoneTasks(data: any) {
+  const lastOf = async (kind: string) => {
+    const { data: rows } = await db
+      .from("phone_tasks")
+      .select("*")
+      .eq("kind", kind)
+      .order("created_at", { ascending: false })
+      .limit(1);
+    return phoneTaskView(rows?.[0]);
+  };
+  switch (data.op) {
+    case "status": {
+      const [login, code, agent] = await Promise.all([
+        lastOf("login"),
+        lastOf("console_code"),
+        db.from("phone_tasks").select("updated_at").eq("id", PHONE_AGENT_ROW).maybeSingle(),
+      ]);
+      if (agent.error) return json({ success: false, error: agent.error.message });
+      const seen = agent.data?.updated_at ? new Date(agent.data.updated_at).getTime() : 0;
+      return json({ success: true, login, code, agentOnline: Date.now() - seen < PHONE_AGENT_ALIVE_MS });
+    }
+    case "login": {
+      const email = str(data.email).trim();
+      if (!email) return json({ success: false, error: "Укажите почту" });
+      const pattern = email.replace(/[\\%_]/g, "\\$&");
+      const { data: found } = await db.from("gpt_accounts").select("email").ilike("email", pattern).limit(1);
+      if (!found?.length) return json({ success: false, error: "Такого аккаунта нет среди сохранённых" });
+      const { error } = await db
+        .from("phone_tasks")
+        .insert({ kind: "login", email: str(found[0].email), actor: str(data.actorLogin) });
+      if (error) return json({ success: false, error: error.message });
+      return json({ success: true });
+    }
+    case "code": {
+      const code = str(data.code).replace(/\D/g, "");
+      if (code.length < 6 || code.length > 8) return json({ success: false, error: "Код — от 6 до 8 цифр" });
+      const { error } = await db.from("phone_tasks").insert({ kind: "console_code", code, actor: str(data.actorLogin) });
+      if (error) return json({ success: false, error: error.message });
+      return json({ success: true });
+    }
+    default:
+      return json({ success: false, error: "Неизвестное действие" });
+  }
+}
+
+// Обращения программы с компьютера: вместо входа — общий с ней ключ.
+// op: "next" — отметиться и взять самое старое ждущее задание (для входа — вместе с паролем и ключом 2FA
+// аккаунта); "finish" — записать итог задания
+async function handlePhoneAgent(data: any) {
+  if (!PHONE_AGENT_KEY || str(data.agentKey) !== PHONE_AGENT_KEY) {
+    return json({ success: false, error: "Неверный ключ программы" }, 403);
+  }
+  const now = new Date().toISOString();
+  switch (data.op) {
+    case "next": {
+      await db
+        .from("phone_tasks")
+        .upsert({ id: PHONE_AGENT_ROW, kind: "agent", status: "done", updated_at: now });
+      // Старые задания не выполняем: их уже никто не ждёт
+      const fresh = new Date(Date.now() - PHONE_TASK_STALE_MS).toISOString();
+      const { data: rows, error } = await db
+        .from("phone_tasks")
+        .select("*")
+        .eq("status", "pending")
+        .neq("kind", "agent")
+        .gt("created_at", fresh)
+        .order("created_at", { ascending: true })
+        .limit(1);
+      if (error) return json({ success: false, error: error.message });
+      const row = rows?.[0];
+      if (!row) return json({ success: true, task: null });
+      const { data: taken } = await db
+        .from("phone_tasks")
+        .update({ status: "running", updated_at: now })
+        .eq("id", row.id)
+        .eq("status", "pending")
+        .select("id");
+      if (!taken?.length) return json({ success: true, task: null });
+      const task: Record<string, string> = { id: row.id, kind: row.kind, email: str(row.email), code: str(row.code) };
+      if (row.kind === "login") {
+        const { data: account } = await db
+          .from("gpt_accounts")
+          .select("password, totp")
+          .ilike("email", str(row.email).replace(/[\\%_]/g, "\\$&"))
+          .limit(1);
+        task.password = str(account?.[0]?.password);
+        task.totp = str(account?.[0]?.totp);
+      }
+      return json({ success: true, task });
+    }
+    case "finish": {
+      const status = data.status === "done" ? "done" : "error";
+      const { error } = await db
+        .from("phone_tasks")
+        .update({ status, message: str(data.message).slice(0, 500), updated_at: now })
+        .eq("id", str(data.id));
+      if (error) return json({ success: false, error: error.message });
+      return json({ success: true });
+    }
+    default:
+      return json({ success: false, error: "Неизвестное действие" });
+  }
 }
 
 async function handleAddEdition(data: any) {
@@ -2501,8 +3608,10 @@ async function fetchViaProxy(
   method: string,
   headers: Record<string, string>,
   body: string,
+  proxyUrl = FIXIE_URL,
+  timeoutMs = PROXY_TIMEOUT_MS,
 ): Promise<{ status: number; text: string }> {
-  const proxy = new URL(FIXIE_URL);
+  const proxy = new URL(proxyUrl);
   const enc = new TextEncoder();
   const conn = await Deno.connect({ hostname: proxy.hostname, port: Number(proxy.port || 80) });
   let stream: Deno.Conn = conn;
@@ -2512,7 +3621,7 @@ async function fetchViaProxy(
     } catch (_e) {
       // уже закрыто
     }
-  }, PROXY_TIMEOUT_MS);
+  }, timeoutMs);
 
   try {
     const auth = btoa(`${decodeURIComponent(proxy.username)}:${decodeURIComponent(proxy.password)}`);
@@ -2553,7 +3662,7 @@ async function fetchViaProxy(
     }
     const raw = concatBytes(parts);
     const headerEnd = indexOfHeaderEnd(raw);
-    if (headerEnd < 0) throw new Error("пустой ответ Cardlink");
+    if (headerEnd < 0) throw new Error("пустой ответ");
     const responseHead = new TextDecoder().decode(raw.subarray(0, headerEnd));
     let responseBody = raw.subarray(headerEnd + 4);
     if (/\r\ntransfer-encoding:\s*chunked/i.test(responseHead)) responseBody = dechunk(responseBody);
@@ -2962,9 +4071,16 @@ Deno.serve(async (req) => {
       if (data.action === "login") {
         return json(await login(str(data.login), String(data.password ?? "")));
       }
+      if (data.action === "register") {
+        return json(await register(str(data.login), String(data.password ?? ""), str(data.code)));
+      }
+      // Программа с компьютера входит не как сотрудник, а по своему ключу
+      if (data.action === "phoneAgent") {
+        return await handlePhoneAgent(data);
+      }
     }
 
-    // Всё, кроме входа, — только с действующим токеном
+    // Всё, кроме входа и регистрации, — только с действующим токеном
     const user = await verifyToken(req.headers.get("x-app-token"));
     if (!user) {
       return json({ success: false, error: "Нужно войти заново", code: "unauthorized" }, 401);
@@ -2974,6 +4090,8 @@ Deno.serve(async (req) => {
     }
     // Кто сделал действие — берём из токена, а не из того, что прислал браузер
     data.actor = user.name || user.login;
+    data.actorLogin = user.login;
+    data.actorRole = user.role;
 
     if (req.method === "GET") {
       const catalog = await buildCatalog();
@@ -2991,6 +4109,12 @@ Deno.serve(async (req) => {
           return await handleUpdatePrices(data);
         case "updateStandardPrices":
           return await handleUpdateStandardPrices(data);
+        case "cdkOrders":
+          return await handleCdkOrders(data);
+        case "gptAccounts":
+          return await handleGptAccounts(data);
+        case "phoneTasks":
+          return await handlePhoneTasks(data);
         case "updateGame":
           return await handleUpdateGame(data);
         case "backfillCovers":

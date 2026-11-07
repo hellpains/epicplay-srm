@@ -26,14 +26,19 @@ import {
   StickyNote,
   Mail,
   Clock,
+  Type,
 } from "lucide-react";
 import AddGameModal from "./components/AddGameModal";
 import AddOrderModal from "./AddOrderModal";
 import { assignSlotFields, avitoChatUrl, slotNamesFor, type SlotOccupant } from "./slotHistory";
 import PriceTable from "./components/PriceTable";
 import StandardPrices from "./components/StandardPrices";
+import CdkTokens from "./components/CdkTokens";
 import { MyLogo } from "./components/MyLogo";
 import { PaymentQrModal } from "./components/PaymentQrModal";
+import { TextFormatModal } from "./components/TextFormatModal";
+import UsdtRate, { USDT_KEY, USDT_PRICE_KEY } from "./components/UsdtRate";
+import CdkDebts, { rub, useCdkDebts } from "./components/CdkDebts";
 
 function ResultDialog({
   type,
@@ -101,15 +106,24 @@ export default function CatalogScreen({
   setSelectedItem,
   variables = { currencies: [] },
   API_URL,
+  // Роль gpt: без «Шеринга» и «Стандарта», в каталоге остаётся только CDK
+  cdkOnly = false,
+  userRole = "",
+  userLogin = "",
 }: any) {
   const [activeEditionTab, setActiveEditionTab] = useState("");
   const [showPrices, setShowPrices] = useState(false);
   const [copyStatus, setCopyStatus] = useState(null);
   const [isModalOpen, setIsModalOpen] = useState(false);
-  const [catalogMode, setCatalogMode] = useState<"шеринг" | "стандарт">("шеринг");
+  const [catalogMode, setCatalogMode] = useState<"шеринг" | "стандарт" | "cdk">(cdkOnly ? "cdk" : "шеринг");
   const [categoryTab, setCategoryTab] = useState("игры");
   const [isSearchActive, setIsSearchActive] = useState(false);
   const [isQrOpen, setIsQrOpen] = useState(false);
+  const [isTextFormatOpen, setIsTextFormatOpen] = useState(false);
+  const [isDebtsOpen, setIsDebtsOpen] = useState(false);
+  const usdtRate = Number(variables.standardPrices?.[USDT_KEY]?.[USDT_PRICE_KEY]) || 0;
+  const debts = useCdkDebts(API_URL, usdtRate, userRole, userLogin);
+  const [isEditingUsdt, setIsEditingUsdt] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
   const [sortBy, setSortBy] = useState("popularity");
 
@@ -1050,26 +1064,46 @@ export default function CatalogScreen({
         <div
           className="relative flex items-center px-6 justify-end overflow-hidden"
           style={{
-            height: "calc(4rem + env(safe-area-inset-top, 24px))",
+            height: "calc(3.375rem + env(safe-area-inset-top, 24px))",
             paddingTop: "env(safe-area-inset-top, 24px)",
           }}
         >
-          <AnimatePresence>
-            {!isSearchActive && (
-              <motion.div
-                initial={{ opacity: 0, x: -10 }}
-                animate={{ opacity: 1, x: 0 }}
-                exit={{ opacity: 0, x: -10 }}
-                transition={{ duration: 0.2 }}
-                className="absolute left-6 right-6 flex items-center justify-between"
-                style={{
-                  top: "calc(env(safe-area-inset-top, 24px) + 0.5rem)",
-                }}
-              >
-                <div className="flex items-center gap-2 ml-2">
-                  <MyLogo className="h-[20px] w-auto text-neutral-400 shrink-0 drop-shadow-sm" />
-                </div>
-                <div className="flex items-center gap-2 mr-12">
+          <div
+            className="absolute left-6 right-6 flex items-center justify-between h-10"
+            style={{
+              top: "calc(env(safe-area-inset-top, 24px) + 11px)",
+            }}
+          >
+            <div className={`flex items-center gap-2 ${cdkOnly ? "" : "ml-2"}`}>
+              {!cdkOnly && <MyLogo className="h-[20px] w-auto text-neutral-400 shrink-0 drop-shadow-sm" />}
+              {/* Свой долг в шапке видит только сотрудник с ролью gpt; у админа долги — в разделе «Долги партнёров» */}
+              {debts.enabled && cdkOnly && (
+                <button
+                  onClick={() => {
+                    debts.reload();
+                    setIsDebtsOpen(true);
+                  }}
+                  className="h-9 px-3 flex items-center gap-1.5 rounded-full bg-white/[0.05] border border-white/10 active:scale-95 transition-all"
+                >
+                  <span className="text-[12px] font-semibold text-neutral-400">Долг:</span>
+                  <span className="text-[14px] font-bold text-white tabular-nums whitespace-nowrap">
+                    {debts.isLoading ? "—" : rub(debts.total)}
+                  </span>
+                </button>
+              )}
+            </div>
+            <div className="flex items-center gap-1">
+              {/* Роли gpt форматирование текста и QR не нужны */}
+              {!isEditingUsdt && !cdkOnly && (
+                <>
+                  <motion.button
+                    onTap={() => setIsTextFormatOpen(true)}
+                    whileTap={{ scale: 0.85 }}
+                    style={{ WebkitTapHighlightColor: "transparent" }}
+                    className="cursor-pointer touch-manipulation select-none h-10 w-10 flex items-center justify-center transition-all"
+                  >
+                    <Type size={18} className="text-neutral-400" />
+                  </motion.button>
                   <motion.button
                     onTap={() => setIsQrOpen(true)}
                     whileTap={{ scale: 0.85 }}
@@ -1078,81 +1112,16 @@ export default function CatalogScreen({
                   >
                     <QrCode size={18} className="text-neutral-400" />
                   </motion.button>
-                  <motion.button
-                    onTap={() => fetchItems(false)}
-                    whileTap={{ scale: 0.85 }}
-                    style={{ WebkitTapHighlightColor: "transparent" }}
-                    className="cursor-pointer touch-manipulation select-none h-10 w-10 flex items-center justify-center transition-all"
-                  >
-                    <RotateCw
-                      size={18}
-                      className={
-                        isSyncing
-                          ? "animate-spin text-green-500"
-                          : "text-neutral-400"
-                      }
-                    />
-                  </motion.button>
-                </div>
-              </motion.div>
-            )}
-          </AnimatePresence>
-
-          <motion.div
-            initial={false}
-            animate={{ width: isSearchActive ? 400 : 40 }}
-            transition={{ type: "spring", stiffness: 350, damping: 30 }}
-            className={`flex items-center h-10 bg-neutral-800 rounded-full z-10 overflow-hidden cursor-pointer touch-manipulation select-none ${
-              isSearchActive
-                ? "border border-neutral-700 px-3 shadow-lg"
-                : "border border-white/10 justify-center"
-            }`}
-            style={{
-              position: "absolute",
-              right: "1.5rem",
-              top: "calc(env(safe-area-inset-top, 24px) + 0.5rem)",
-              maxWidth: "calc(100% - 3rem)",
-              WebkitTapHighlightColor: "transparent"
-            }}
-            onClick={() => {
-              if (!isSearchActive) setIsSearchActive(true);
-            }}
-          >
-            <Search size={18} className="text-neutral-400 shrink-0" />
-            <AnimatePresence>
-              {isSearchActive && (
-                <motion.div
-                  initial={{ opacity: 0 }}
-                  animate={{ opacity: 1 }}
-                  exit={{ opacity: 0 }}
-                  transition={{ duration: 0.1 }}
-                  className="flex-1 flex items-center ml-2"
-                >
-                  <input
-                    ref={searchInputRef}
-                    autoFocus
-                    type="text"
-                    placeholder="Поиск..."
-                    value={searchQuery}
-                    onChange={(e) => setSearchQuery(e.target.value)}
-                    className="w-full bg-transparent border-none outline-none text-white text-sm"
-                  />
-                  <motion.button
-                    onTap={(e) => {
-                      e.stopPropagation();
-                      setIsSearchActive(false);
-                      setSearchQuery("");
-                    }}
-                    whileTap={{ scale: 0.8 }}
-                    style={{ WebkitTapHighlightColor: "transparent" }}
-                    className="cursor-pointer touch-manipulation select-none p-1 shrink-0"
-                  >
-                    <X size={16} className="text-neutral-400" />
-                  </motion.button>
-                </motion.div>
+                </>
               )}
-            </AnimatePresence>
-          </motion.div>
+              <UsdtRate
+                standardPrices={variables.standardPrices ?? {}}
+                apiUrl={API_URL}
+                onSaved={() => fetchItems(true)}
+                onEditingChange={setIsEditingUsdt}
+              />
+            </div>
+          </div>
         </div>
       </div>
 
@@ -1165,18 +1134,20 @@ export default function CatalogScreen({
       >
         <div
           style={{
-            height: "calc(4rem + env(safe-area-inset-top, 24px) + 8px)",
+            height: "calc(3.375rem + env(safe-area-inset-top, 24px) + 8px)",
           }}
           className="pointer-events-none shrink-0"
         />
 
-        <div className="px-6 mt-4 mb-4">
-          <div className="flex bg-neutral-800/50 backdrop-blur-md p-1.5 rounded-2xl border border-neutral-800 relative">
+        <div className={cdkOnly ? "mt-4" : "px-6 mt-4 mb-4"}>
+          <div className={`${cdkOnly ? "hidden" : "flex"} bg-neutral-800/50 backdrop-blur-md p-1.5 rounded-2xl border border-neutral-800 relative`}>
             <div
-              className={`absolute inset-y-1.5 left-1.5 w-[calc(50%-6px)] bg-neutral-700 rounded-xl transition-transform duration-200 ease-out ${
-                catalogMode === "стандарт"
-                  ? "translate-x-full"
-                  : "translate-x-0"
+              className={`absolute inset-y-1.5 left-1.5 w-[calc((100%-12px)/3)] bg-neutral-700 rounded-xl transition-transform duration-200 ease-out ${
+                catalogMode === "cdk"
+                  ? "translate-x-[200%]"
+                  : catalogMode === "стандарт"
+                    ? "translate-x-full"
+                    : "translate-x-0"
               }`}
             />
             <motion.button
@@ -1196,6 +1167,15 @@ export default function CatalogScreen({
               }`}
             >
               Стандарт
+            </motion.button>
+            <motion.button
+              onTap={() => setCatalogMode("cdk")}
+              style={{ WebkitTapHighlightColor: "transparent" }}
+              className={`cursor-pointer touch-manipulation select-none relative z-10 flex-1 py-2.5 text-sm font-semibold transition-colors ${
+                catalogMode === "cdk" ? "text-white" : "text-neutral-500"
+              }`}
+            >
+              CDK
             </motion.button>
           </div>
         </div>
@@ -1294,12 +1274,14 @@ export default function CatalogScreen({
           </div>
         )}
         </>
-        ) : (
+        ) : catalogMode === "стандарт" ? (
           <StandardPrices
             standardPrices={variables.standardPrices ?? {}}
             apiUrl={API_URL}
             onSaved={() => fetchItems(true)}
           />
+        ) : (
+          <CdkTokens standardPrices={variables.standardPrices ?? {}} apiUrl={API_URL} />
         )}
       </div>
 
@@ -2865,6 +2847,21 @@ export default function CatalogScreen({
 
       <AnimatePresence>
         {isQrOpen && <PaymentQrModal onClose={() => setIsQrOpen(false)} />}
+      </AnimatePresence>
+
+      <AnimatePresence>
+        {isDebtsOpen && (
+          <CdkDebts
+            debts={debts}
+            usdtRate={usdtRate}
+            showActor={userRole === "admin"}
+            onClose={() => setIsDebtsOpen(false)}
+          />
+        )}
+      </AnimatePresence>
+
+      <AnimatePresence>
+        {isTextFormatOpen &&<TextFormatModal onClose={() => setIsTextFormatOpen(false)} />}
       </AnimatePresence>
     </>
   );

@@ -1,17 +1,24 @@
 import {useState, useEffect} from "react";
 import {AnimatePresence, motion} from "framer-motion";
-import {Menu, Search, Plus, Copy, User, LockKeyhole} from "lucide-react";
+import {Menu, Search, Plus, Copy, User, LockKeyhole, Loader2} from "lucide-react";
 import CatalogScreen from "./CatalogScreen";
 import PriceSearchScreen from "./PriceSearchScreen";
 import AddOrderModal from "./AddOrderModal";
 import ActivityScreen from "./ActivityScreen";
 import {API_URL, AUTH_EXPIRED_EVENT, SESSION_KEY, apiFetch} from "./config";
+import {USDT_KEY, USDT_PRICE_KEY} from "./components/UsdtRate";
+import {rub, useCdkDebts} from "./components/CdkDebts";
+import GptAccounts from "./components/GptAccounts";
+import PhoneTasks from "./components/PhoneTasks";
 
 function AuthWall({onLoginSuccess}: { onLoginSuccess: (user: any) => void }) {
     const [login, setLogin] = useState("");
     const [password, setPassword] = useState("");
     const [loading, setLoading] = useState(false);
     const [error, setError] = useState("");
+    const [isRegister, setIsRegister] = useState(false);
+    // Регистрация — только по коду приглашения от администратора
+    const [inviteCode, setInviteCode] = useState("");
 
     const handleLogin = async (e: any) => {
         e.preventDefault();
@@ -21,16 +28,20 @@ function AuthWall({onLoginSuccess}: { onLoginSuccess: (user: any) => void }) {
         try {
             const response = await fetch(API_URL, {
                 method: "POST",
-                body: JSON.stringify({action: "login", login, password}),
+                body: JSON.stringify(
+                    isRegister
+                        ? {action: "register", login, password, code: inviteCode}
+                        : {action: "login", login, password}
+                ),
             });
             const data = await response.json();
 
             if (data.success) {
-                const userData = {login, role: data.role, name: data.name, token: data.token};
+                const userData = {login: login.trim(), role: data.role, name: data.name, token: data.token};
                 localStorage.setItem(SESSION_KEY, JSON.stringify(userData));
                 onLoginSuccess(userData);
             } else {
-                setError(data.message || "Неверный логин или пароль");
+                setError(data.message || (isRegister ? "Не удалось зарегистрироваться" : "Неверный логин или пароль"));
             }
         } catch (err) {
             setError("Ошибка сети. Проверьте интернет.");
@@ -51,7 +62,7 @@ function AuthWall({onLoginSuccess}: { onLoginSuccess: (user: any) => void }) {
                     <LockKeyhole size={36} className="text-[#12c83b]"/>
                 </div>
                 <h2 className="text-2xl font-semibold text-white mb-2 tracking-tight">
-                    Авторизация
+                    {isRegister ? "Регистрация" : "Авторизация"}
                 </h2>
 
                 <form
@@ -73,12 +84,26 @@ function AuthWall({onLoginSuccess}: { onLoginSuccess: (user: any) => void }) {
                     <input
                         type="password"
                         placeholder="Пароль"
-                        autoComplete="current-password"
+                        autoComplete={isRegister ? "new-password" : "current-password"}
                         value={password}
                         onChange={(e) => setPassword(e.target.value)}
                         className="w-full bg-[#1c1c1e] border border-white/10 rounded-xl px-4 py-3.5 text-[16px] text-white outline-none focus:border-[#12c83b]/50 transition-colors"
                         required
                     />
+                    {isRegister && (
+                        <input
+                            type="text"
+                            placeholder="Код приглашения"
+                            autoCapitalize="none"
+                            autoCorrect="off"
+                            spellCheck={false}
+                            autoComplete="off"
+                            value={inviteCode}
+                            onChange={(e) => setInviteCode(e.target.value)}
+                            className="w-full bg-[#1c1c1e] border border-white/10 rounded-xl px-4 py-3.5 text-[16px] text-white outline-none focus:border-[#12c83b]/50 transition-colors"
+                            required
+                        />
+                    )}
 
                     <AnimatePresence>
                         {error && (
@@ -95,10 +120,20 @@ function AuthWall({onLoginSuccess}: { onLoginSuccess: (user: any) => void }) {
 
                     <button
                         type="submit"
-                        disabled={!login || !password || loading}
+                        disabled={!login || !password || (isRegister && !inviteCode) || loading}
                         className="mt-4 w-full py-4 bg-[#12c83b] text-black font-bold rounded-xl active:scale-95 transition-all text-[16px] disabled:opacity-50"
                     >
-                        {loading ? "Проверка..." : "Войти в систему"}
+                        {loading ? "Проверка..." : isRegister ? "Зарегистрироваться" : "Войти в систему"}
+                    </button>
+                    <button
+                        type="button"
+                        onClick={() => {
+                            setIsRegister(!isRegister);
+                            setError("");
+                        }}
+                        className="text-sm text-neutral-400 active:text-white transition-colors"
+                    >
+                        {isRegister ? "Уже есть аккаунт? Войти" : "Нет аккаунта? Регистрация"}
                     </button>
                 </form>
             </div>
@@ -111,6 +146,52 @@ const TemplatesScreen = () => (
         Скоро
     </div>
 );
+
+// Раздел админа «Долги партнёров»: все сотрудники с ролью gpt и сколько каждый сейчас должен
+function DebtorScreen({usdtRate, userLogin}: { usdtRate: number; userLogin: string }) {
+    const debts = useCdkDebts(API_URL, usdtRate, "admin", userLogin);
+    // Самый большой долг сверху
+    const debtors = debts.gptLogins
+        .map((login) => ({login, ...debts.debtOf(login)}))
+        .sort((a, b) => b.total - a.total || a.login.localeCompare(b.login));
+
+    return (
+        <div className="px-6" style={{paddingTop: "calc(env(safe-area-inset-top, 24px) + 0.75rem)"}}>
+            <div className="text-[28px] font-bold text-white tracking-tight">Долги партнёров</div>
+            {!(usdtRate > 0) && (
+                <div className="mt-2 text-[13px] text-amber-400">Курс USDT в шапке не задан — посчитать долг нельзя.</div>
+            )}
+            {debts.isLoading ? (
+                debts.error ? (
+                    <div className="py-6 text-center text-[13px] text-red-400">{debts.error}</div>
+                ) : (
+                    <div className="flex justify-center py-6">
+                        <Loader2 size={20} className="animate-spin text-neutral-500"/>
+                    </div>
+                )
+            ) : debtors.length === 0 ? (
+                <div className="py-6 text-center text-[13px] text-neutral-600">Должников пока нет</div>
+            ) : (
+                <div className="mt-4 flex flex-col gap-1.5">
+                    {debtors.map((debtor) => (
+                        <div
+                            key={debtor.login}
+                            className="px-4 py-3 rounded-[16px] bg-white/[0.04] border border-white/5 flex items-center justify-between gap-3"
+                        >
+                            <div className="min-w-0 truncate text-[15px] font-semibold text-white">{debtor.login}</div>
+                            <div className="shrink-0 text-[15px] font-bold tabular-nums text-white">
+                                {debtor.isPartial && "от "}
+                                {rub(debtor.total)}
+                            </div>
+                        </div>
+                    ))}
+                </div>
+            )}
+            <PhoneTasks apiUrl={API_URL}/>
+            <GptAccounts apiUrl={API_URL}/>
+        </div>
+    );
+}
 
 export default function App() {
     // Сессия без токена (вход до появления авторизации на сервере) — просим войти заново
@@ -240,6 +321,9 @@ export default function App() {
                     setSelectedItem={setSelectedItem}
                     variables={variables}
                     API_URL={API_URL}
+                    cdkOnly={authUser.role === "gpt"}
+                    userRole={authUser.role}
+                    userLogin={authUser.login ?? ""}
                 />
             )}
 
@@ -251,7 +335,14 @@ export default function App() {
             )}
 
             {currentScreen === "templates" && (
-                <TemplatesScreen/>
+                authUser.role === "admin" ? (
+                    <DebtorScreen
+                        usdtRate={Number(variables.standardPrices?.[USDT_KEY]?.[USDT_PRICE_KEY]) || 0}
+                        userLogin={authUser.login ?? ""}
+                    />
+                ) : (
+                    <TemplatesScreen/>
+                )
             )}
 
             {currentScreen === "profile" && (
